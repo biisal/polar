@@ -57,7 +57,7 @@ from polar.models.checkout import CheckoutStatus
 from polar.models.discount import DiscountDuration, DiscountType
 from polar.models.order import OrderBillingReasonInternal, OrderStatus
 from polar.models.organization import Organization, OrganizationStatus
-from polar.models.payment import PaymentStatus
+from polar.models.payment import PaymentStatus, PaymentTrigger
 from polar.models.product import ProductBillingType
 from polar.models.subscription import SubscriptionStatus
 from polar.models.transaction import PlatformFeeType, TransactionType
@@ -984,6 +984,7 @@ class TestCreateSubscriptionOrder:
             "order.trigger_payment",
             order_id=order.id,
             payment_method_id=subscription.payment_method_id,
+            payment_trigger="purchase",
         )
 
     async def test_cycle_discount(
@@ -1297,6 +1298,7 @@ class TestCreateSubscriptionOrder:
             "order.trigger_payment",
             order_id=order.id,
             payment_method_id=subscription.payment_method_id,
+            payment_trigger="purchase",
         )
 
     @pytest.mark.parametrize(
@@ -1561,6 +1563,7 @@ class TestCreateSubscriptionOrder:
                 "order.trigger_payment",
                 order_id=order.id,
                 payment_method_id=subscription.payment_method_id,
+                payment_trigger="purchase",
             )
             assert customer_balance == 0
         else:
@@ -2618,6 +2621,7 @@ class TestHandlePaymentFailure:
             save_fixture,
             order.organization,
             status=PaymentStatus.failed,
+            trigger=PaymentTrigger.purchase,
             order=order,
         )
 
@@ -2667,12 +2671,14 @@ class TestHandlePaymentFailure:
             save_fixture,
             order.organization,
             status=PaymentStatus.failed,
+            trigger=PaymentTrigger.purchase,
             order=order,
         )
         await create_payment(
             save_fixture,
             order.organization,
             status=PaymentStatus.failed,
+            trigger=PaymentTrigger.purchase,
             order=order,
         )
 
@@ -2723,6 +2729,7 @@ class TestHandlePaymentFailure:
                 save_fixture,
                 order.organization,
                 status=PaymentStatus.failed,
+                trigger=PaymentTrigger.purchase,
                 order=order,
             )
 
@@ -2772,6 +2779,7 @@ class TestHandlePaymentFailure:
                 save_fixture,
                 order.organization,
                 status=PaymentStatus.failed,
+                trigger=PaymentTrigger.purchase,
                 order=order,
             )
 
@@ -2819,6 +2827,7 @@ class TestHandlePaymentFailure:
             save_fixture,
             order.organization,
             status=PaymentStatus.failed,
+            trigger=PaymentTrigger.purchase,
             order=order,
         )
         await create_payment(
@@ -2954,6 +2963,7 @@ class TestHandlePaymentFailure:
             order.organization,
             status=PaymentStatus.failed,
             decline_reason="stolen_card",
+            trigger=PaymentTrigger.purchase,
             order=order,
         )
 
@@ -3015,6 +3025,7 @@ class TestHandlePaymentFailure:
             order.organization,
             status=PaymentStatus.failed,
             decline_reason="insufficient_funds",
+            trigger=PaymentTrigger.purchase,
             order=order,
         )
 
@@ -3068,6 +3079,7 @@ class TestHandlePaymentFailure:
             order.organization,
             status=PaymentStatus.failed,
             decline_reason="stolen_card",
+            trigger=PaymentTrigger.purchase,
             order=order,
         )
 
@@ -3247,6 +3259,7 @@ class TestProcessDunningOrder:
             "order.trigger_payment",
             order_id=order.id,
             payment_method_id=payment_method.id,
+            payment_trigger="retry_dunning",
         )
 
 
@@ -3257,13 +3270,14 @@ class TestScheduleRetryForPastDueOrders:
     @freeze_time("2024-01-15 12:00:00")
     async def test_schedules_retry_for_past_due_no_next_attempt(
         self,
+        enqueue_job_mock: MagicMock,
         session: AsyncSession,
         save_fixture: SaveFixture,
         customer: Customer,
         product: Product,
     ) -> None:
         """When a customer saves a new payment method and has a past_due subscription
-        with no next_payment_attempt_at, a retry should be scheduled immediately."""
+        with no next_payment_attempt_at, a payment should be enqueued immediately."""
         payment_method = await create_payment_method(save_fixture, customer=customer)
         subscription = await create_subscription(
             save_fixture,
@@ -3292,9 +3306,12 @@ class TestScheduleRetryForPastDueOrders:
         )
 
         # Then
-        await session.refresh(order)
-        assert order.next_payment_attempt_at is not None
-        assert order.next_payment_attempt_at == utc_now()
+        enqueue_job_mock.assert_called_once_with(
+            "order.trigger_payment",
+            order_id=order.id,
+            payment_method_id=new_payment_method.id,
+            payment_trigger="retry_payment_method_update",
+        )
 
         await session.refresh(subscription)
         assert subscription.payment_method_id == new_payment_method.id
@@ -3302,6 +3319,7 @@ class TestScheduleRetryForPastDueOrders:
     @freeze_time("2024-01-15 12:00:00")
     async def test_skips_canceled_subscription(
         self,
+        enqueue_job_mock: MagicMock,
         session: AsyncSession,
         save_fixture: SaveFixture,
         customer: Customer,
@@ -3319,7 +3337,7 @@ class TestScheduleRetryForPastDueOrders:
             payment_method=payment_method,
             cancel_at_period_end=True,
         )
-        order = await create_order(
+        await create_order(
             save_fixture,
             product=product,
             customer=customer,
@@ -3338,12 +3356,12 @@ class TestScheduleRetryForPastDueOrders:
         )
 
         # Then — no retry scheduled
-        await session.refresh(order)
-        assert order.next_payment_attempt_at is None
+        enqueue_job_mock.assert_not_called()
 
     @freeze_time("2024-02-01 12:00:00")
     async def test_skips_past_deadline(
         self,
+        enqueue_job_mock: MagicMock,
         session: AsyncSession,
         save_fixture: SaveFixture,
         customer: Customer,
@@ -3361,7 +3379,7 @@ class TestScheduleRetryForPastDueOrders:
             past_due_at=datetime(2024, 1, 1, 0, 0, 0, tzinfo=UTC),
             payment_method=payment_method,
         )
-        order = await create_order(
+        await create_order(
             save_fixture,
             product=product,
             customer=customer,
@@ -3380,19 +3398,19 @@ class TestScheduleRetryForPastDueOrders:
         )
 
         # Then — no retry scheduled (deadline expired)
-        await session.refresh(order)
-        assert order.next_payment_attempt_at is None
+        enqueue_job_mock.assert_not_called()
 
     @freeze_time("2024-01-15 12:00:00")
-    async def test_moves_up_retry_if_next_attempt_already_set(
+    async def test_enqueues_payment_if_next_attempt_already_set(
         self,
+        enqueue_job_mock: MagicMock,
         session: AsyncSession,
         save_fixture: SaveFixture,
         customer: Customer,
         product: Product,
     ) -> None:
-        """When a customer saves a new payment method, an existing scheduled retry
-        should be moved up to now for immediate recovery."""
+        """When a customer saves a new payment method, a payment should be
+        enqueued immediately even if next_payment_attempt_at was already set."""
         payment_method = await create_payment_method(save_fixture, customer=customer)
         existing_retry_date = datetime(2024, 1, 16, 0, 0, 0, tzinfo=UTC)
         subscription = await create_subscription(
@@ -3421,9 +3439,13 @@ class TestScheduleRetryForPastDueOrders:
             session, customer, new_payment_method
         )
 
-        # Then — retry moved up to now for immediate recovery
-        await session.refresh(order)
-        assert order.next_payment_attempt_at == utc_now()
+        # Then — payment enqueued immediately
+        enqueue_job_mock.assert_called_once_with(
+            "order.trigger_payment",
+            order_id=order.id,
+            payment_method_id=new_payment_method.id,
+            payment_trigger="retry_payment_method_update",
+        )
 
         await session.refresh(subscription)
         assert subscription.payment_method_id == new_payment_method.id
@@ -3431,6 +3453,7 @@ class TestScheduleRetryForPastDueOrders:
     @freeze_time("2024-01-15 12:00:00")
     async def test_skips_active_subscription(
         self,
+        enqueue_job_mock: MagicMock,
         session: AsyncSession,
         save_fixture: SaveFixture,
         customer: Customer,
@@ -3444,7 +3467,7 @@ class TestScheduleRetryForPastDueOrders:
             customer=customer,
             payment_method=payment_method,
         )
-        order = await create_order(
+        await create_order(
             save_fixture,
             product=product,
             customer=customer,
@@ -3463,8 +3486,7 @@ class TestScheduleRetryForPastDueOrders:
         )
 
         # Then — no retry scheduled (subscription is active, not past_due)
-        await session.refresh(order)
-        assert order.next_payment_attempt_at is None
+        enqueue_job_mock.assert_not_called()
 
 
 @pytest.mark.asyncio
