@@ -110,6 +110,50 @@ async def get(
 
 
 @router.get(
+    "/{id}/account",
+    response_model=AccountSchema,
+    summary="Get Organization Account",
+    responses={
+        403: {
+            "description": "User is not the admin of the account.",
+            "model": NotPermitted.schema(),
+        },
+        404: {
+            "description": "Organization not found or account not set.",
+            "model": ResourceNotFound.schema(),
+        },
+    },
+    tags=[APITag.private],
+)
+async def get_account(
+    id: OrganizationID,
+    auth_subject: auth.OrganizationsRead,
+    session: AsyncReadSession = Depends(get_db_read_session),
+) -> Account:
+    """Get the account for an organization."""
+    organization = await organization_service.get(session, auth_subject, id)
+
+    if organization is None:
+        raise ResourceNotFound()
+
+    if organization.account_id is None:
+        raise ResourceNotFound()
+
+    if is_user(auth_subject):
+        user = auth_subject.subject
+        if not await account_service.is_user_admin(
+            session, organization.account_id, user
+        ):
+            raise NotPermitted("You are not the admin of this account")
+
+    account = await account_service.get(session, auth_subject, organization.account_id)
+    if account is None:
+        raise ResourceNotFound()
+
+    return account
+
+
+@router.get(
     "/{id}/kyc",
     summary="Get Organization KYC Details",
     response_model=OrganizationKYC,
@@ -218,50 +262,6 @@ async def delete(
         requires_support=not result.can_delete_immediately,
         blocked_reasons=result.blocked_reasons,
     )
-
-
-@router.get(
-    "/{id}/account",
-    response_model=AccountSchema,
-    summary="Get Organization Account",
-    responses={
-        403: {
-            "description": "User is not the admin of the account.",
-            "model": NotPermitted.schema(),
-        },
-        404: {
-            "description": "Organization not found or account not set.",
-            "model": ResourceNotFound.schema(),
-        },
-    },
-    tags=[APITag.private],
-)
-async def get_account(
-    id: OrganizationID,
-    auth_subject: auth.OrganizationsRead,
-    session: AsyncReadSession = Depends(get_db_read_session),
-) -> Account:
-    """Get the account for an organization."""
-    organization = await organization_service.get(session, auth_subject, id)
-
-    if organization is None:
-        raise ResourceNotFound()
-
-    if organization.account_id is None:
-        raise ResourceNotFound()
-
-    if is_user(auth_subject):
-        user = auth_subject.subject
-        if not await account_service.is_user_admin(
-            session, organization.account_id, user
-        ):
-            raise NotPermitted("You are not the admin of this account")
-
-    account = await account_service.get(session, auth_subject, organization.account_id)
-    if account is None:
-        raise ResourceNotFound()
-
-    return account
 
 
 @router.get(
