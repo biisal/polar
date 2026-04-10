@@ -240,6 +240,16 @@ class PaymentRetryValidationError(OrderError):
         super().__init__(message, 422)
 
 
+class ManualRetryLimitExceeded(OrderError):
+    def __init__(self, order: Order) -> None:
+        self.order = order
+        message = (
+            f"Maximum number of manual payment retry attempts has been reached "
+            f"for order {order.id}."
+        )
+        super().__init__(message, 429)
+
+
 class SubscriptionNotTrialing(OrderError):
     def __init__(self, subscription: Subscription) -> None:
         self.subscription = subscription
@@ -295,6 +305,7 @@ class OrderService:
         customer_id: Sequence[uuid.UUID] | None = None,
         external_customer_id: Sequence[str] | None = None,
         checkout_id: Sequence[uuid.UUID] | None = None,
+        subscription_id: Sequence[uuid.UUID] | None = None,
         metadata: MetadataQuery | None = None,
         pagination: PaginationParams,
         sorting: list[Sorting[OrderSortProperty]] = [
@@ -339,6 +350,9 @@ class OrderService:
 
         if checkout_id is not None:
             statement = statement.where(Order.checkout_id.in_(checkout_id))
+
+        if subscription_id is not None:
+            statement = statement.where(Order.subscription_id.in_(subscription_id))
 
         if metadata is not None:
             statement = apply_metadata_clause(Order, statement, metadata)
@@ -1170,6 +1184,13 @@ class OrderService:
             raise PaymentRetryValidationError(
                 "Only one of confirmation_token_id or payment_method_id can be provided"
             )
+
+        payment_repository = PaymentRepository.from_session(session)
+        customer_retry_count = (
+            await payment_repository.count_customer_retry_payments_for_order(order.id)
+        )
+        if customer_retry_count >= settings.CUSTOMER_RETRY_MAX_ATTEMPTS:
+            raise ManualRetryLimitExceeded(order)
 
         customer_repository = CustomerRepository.from_session(session)
         customer = await customer_repository.get_by_id(order.customer_id)

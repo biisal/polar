@@ -330,6 +330,16 @@ class Settings(BaseSettings):
     POLAR_FREE_PRODUCT_ID: str = ""
     POLAR_API_URL: str = "https://api.polar.sh"
 
+    @property
+    def POLAR_SELF_ENABLED(self) -> bool:
+        return all(
+            [
+                self.POLAR_ACCESS_TOKEN,
+                self.POLAR_ORGANIZATION_ID,
+                self.POLAR_FREE_PRODUCT_ID,
+            ]
+        )
+
     # Invoices
     S3_CUSTOMER_INVOICES_BUCKET_NAME: str = "polar-customer-invoices"
     S3_PAYOUT_INVOICES_BUCKET_NAME: str = "polar-payout-invoices"
@@ -429,6 +439,7 @@ class Settings(BaseSettings):
         timedelta(days=7),  # Third retry after 14 days (2 + 5 + 7)
         timedelta(days=7),  # Fourth retry after 21 days (2 + 5 + 7 + 7)
     ]
+    CUSTOMER_RETRY_MAX_ATTEMPTS: int = 5
 
     TAX_PROCESSORS: list[TaxProcessor] = [TaxProcessor.stripe]
     TAX_RECORD_PROCESSOR: TaxProcessor = TaxProcessor.stripe

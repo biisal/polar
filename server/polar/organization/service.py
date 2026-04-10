@@ -17,6 +17,7 @@ from polar.enums import InvoiceNumbering
 from polar.exceptions import NotPermitted, PolarError, PolarRequestValidationError
 from polar.integrations.loops.service import loops as loops_service
 from polar.integrations.plain.service import plain as plain_service
+from polar.integrations.polar.service import polar_self as polar_self_service
 from polar.kit.anonymization import anonymize_email_for_deletion, anonymize_for_deletion
 from polar.kit.currency import PresentmentCurrency
 from polar.kit.pagination import PaginationParams
@@ -194,10 +195,23 @@ class OrganizationService:
                 customer_invoice_prefix=create_schema.slug.upper(),
             )
         )
-        await self.add_user(session, organization, auth_subject.subject)
         organization.account = await account_service.create(
             session, auth_subject.subject
         )
+
+        await session.flush()
+        polar_self_service.enqueue_create_customer(
+            organization_id=organization.id,
+            email=organization.email or auth_subject.subject.email,
+            name=organization.name,
+        )
+        await self.add_user(
+            session,
+            organization,
+            auth_subject.subject,
+            polar_self_member_delay=polar_self_service.INITIAL_MEMBER_DELAY_MS,
+        )
+
         enqueue_job("organization.created", organization_id=organization.id)
 
         posthog.auth_subject_event(
@@ -582,6 +596,8 @@ class OrganizationService:
         session: AsyncSession,
         organization: Organization,
         user: User,
+        *,
+        polar_self_member_delay: int | None = None,
     ) -> None:
         nested = await session.begin_nested()
         try:
@@ -620,6 +636,13 @@ class OrganizationService:
             await session.flush()
         finally:
             await loops_service.user_organization_added(session, user)
+            polar_self_service.enqueue_add_member(
+                external_customer_id=str(organization.id),
+                email=user.email,
+                name=user.public_name,
+                external_id=str(user.id),
+                delay=polar_self_member_delay,
+            )
 
     async def set_account(
         self,
