@@ -82,20 +82,19 @@ export function SandboxStep() {
       })
 
     if (createError) {
-      const fallbackMessage =
-        "Failed to create organization. Please try again.";
+      const fallbackMessage = 'Failed to create organization. Please try again.'
 
-      let errorMessage = fallbackMessage;
+      let errorMessage = fallbackMessage
 
       if (Array.isArray(createError?.detail) && createError.detail.length > 0) {
-        errorMessage = createError.detail[0]?.msg || fallbackMessage;
-      } else if (typeof createError?.detail === "string") {
-        errorMessage = createError.detail;
+        errorMessage = createError.detail[0]?.msg || fallbackMessage
+      } else if (typeof createError?.detail === 'string') {
+        errorMessage = createError.detail
       }
 
-      setError(errorMessage);
-      setSubmitting(false);
-      return;
+      setError(errorMessage)
+      setSubmitting(false)
+      return
     }
 
     setUserOrganizations((prev) => [...prev, org])
