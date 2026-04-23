@@ -2,11 +2,12 @@ import uuid
 
 import structlog
 from pydantic import HttpUrl
-from sqlalchemy import delete, select
+from sqlalchemy import select
 from sqlalchemy.orm import joinedload
 from sqlalchemy.orm.strategy_options import contains_eager
 
 from polar.auth.models import AuthSubject, Organization, User
+from polar.authz.service import get_accessible_org_ids
 from polar.config import settings
 from polar.customer.repository import CustomerRepository
 from polar.enums import TokenType
@@ -22,6 +23,7 @@ from polar.models import Customer, CustomerSession, Member, MemberSession
 from polar.models.customer import CustomerType
 from polar.postgres import AsyncSession
 
+from .repository import CustomerSessionRepository
 from .schemas import CustomerSessionCreate, CustomerSessionCustomerIDCreate
 
 log: Logger = structlog.get_logger()
@@ -62,22 +64,21 @@ class CustomerSessionService(ResourceServiceReader[CustomerSession]):
         customer_create: CustomerSessionCreate,
     ) -> Customer:
         repository = CustomerRepository.from_session(session)
-        statement = repository.get_readable_statement(auth_subject).options(
-            joinedload(Customer.organization),
-        )
+        org_ids = await get_accessible_org_ids(session, auth_subject)
+        options = (joinedload(Customer.organization),)
 
         if isinstance(customer_create, CustomerSessionCustomerIDCreate):
-            statement = statement.where(Customer.id == customer_create.customer_id)
             id_field = "customer_id"
             id_value: uuid.UUID | str = customer_create.customer_id
-        else:
-            statement = statement.where(
-                Customer.external_id == customer_create.external_customer_id
+            customer = await repository.get_readable_by_id(
+                org_ids, customer_create.customer_id, options=options
             )
+        else:
             id_field = "external_customer_id"
             id_value = customer_create.external_customer_id
-
-        customer = await repository.get_one_or_none(statement)
+            customer = await repository.get_readable_by_external_id(
+                org_ids, customer_create.external_customer_id, options=options
+            )
 
         if customer is None:
             raise PolarRequestValidationError(
@@ -248,10 +249,8 @@ class CustomerSessionService(ResourceServiceReader[CustomerSession]):
         return result.unique().scalar_one_or_none()
 
     async def delete_expired(self, session: AsyncSession) -> None:
-        statement = delete(CustomerSession).where(
-            CustomerSession.expires_at < utc_now()
-        )
-        await session.execute(statement)
+        repository = CustomerSessionRepository.from_session(session)
+        await repository.delete_expired()
 
     async def revoke_leaked(
         self,

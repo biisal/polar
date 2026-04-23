@@ -75,6 +75,7 @@ def _make_agent_result(
             collected_at=datetime(2026, 1, 1, tzinfo=UTC),
         ),
         model_used=model_used,
+        model_provider="openai",
         duration_seconds=1.0,
         usage=UsageInfo(),
         timed_out=False,
@@ -131,7 +132,6 @@ class TestRunReviewAgentGrandfathered:
                 new_callable=AsyncMock,
                 return_value=agent_result,
             ),
-            patch("polar.organization_review.tasks.plain_service"),
         ):
             await _run_review_agent(
                 organization.id,
@@ -190,7 +190,6 @@ class TestRunReviewAgentGrandfathered:
                 new_callable=AsyncMock,
                 return_value=agent_result,
             ),
-            patch("polar.organization_review.tasks.plain_service"),
         ):
             await _run_review_agent(
                 organization.id,
@@ -233,7 +232,6 @@ class TestRunReviewAgentGrandfathered:
                 new_callable=AsyncMock,
                 return_value=agent_result,
             ),
-            patch("polar.organization_review.tasks.plain_service"),
         ):
             await _run_review_agent(
                 organization.id,
@@ -287,7 +285,6 @@ class TestRunReviewAgentGrandfathered:
                 new_callable=AsyncMock,
                 return_value=agent_result,
             ),
-            patch("polar.organization_review.tasks.plain_service"),
         ):
             await _run_review_agent(
                 organization.id,

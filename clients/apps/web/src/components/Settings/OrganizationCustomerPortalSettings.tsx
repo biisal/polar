@@ -1,6 +1,6 @@
 import { useUpdateOrganization } from '@/hooks/queries'
 import { useAutoSave } from '@/hooks/useAutoSave'
-import { setValidationErrors } from '@/utils/api/errors'
+import { extractApiErrorMessage, setValidationErrors } from '@/utils/api/errors'
 import { isValidationError, schemas } from '@polar-sh/client'
 import Switch from '@polar-sh/ui/components/atoms/Switch'
 import {
@@ -23,7 +23,13 @@ const OrganizationCustomerPortalSettings: React.FC<
   OrganizationCustomerPortalSettingsProps
 > = ({ organization }) => {
   const form = useForm<schemas['OrganizationCustomerPortalSettings']>({
-    defaultValues: organization.customer_portal_settings,
+    defaultValues: {
+      ...organization.customer_portal_settings,
+      customer: {
+        allow_email_change: false,
+        ...organization.customer_portal_settings.customer,
+      },
+    },
   })
   const { control, setError, reset } = form
 
@@ -47,7 +53,7 @@ const OrganizationCustomerPortalSettings: React.FC<
 
       toast({
         title: 'Customer Portal Settings Update Failed',
-        description: `Error updating customer portal settings: ${error.detail}`,
+        description: `Error updating customer portal settings: ${extractApiErrorMessage(error)}`,
       })
 
       return
@@ -98,6 +104,27 @@ const OrganizationCustomerPortalSettings: React.FC<
             <FormField
               control={control}
               name="subscription.update_seats"
+              render={({ field }) => (
+                <FormItem>
+                  <FormControl>
+                    <Switch
+                      checked={field.value}
+                      onCheckedChange={field.onChange}
+                    />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+          </SettingsGroupItem>
+
+          <SettingsGroupItem
+            title="Allow email address changes"
+            description="Allow customers to change the email address associated with their account."
+          >
+            <FormField
+              control={control}
+              name="customer.allow_email_change"
               render={({ field }) => (
                 <FormItem>
                   <FormControl>

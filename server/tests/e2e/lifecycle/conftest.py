@@ -18,6 +18,7 @@ from tests.e2e.infra import DrainFn, DrainResult
 from tests.e2e.purchase.subscription.conftest import monthly_product  # noqa: F401
 from tests.fixtures.database import SaveFixture
 from tests.fixtures.random_objects import (
+    create_account,
     create_benefit,
     create_organization,
     create_product,
@@ -99,8 +100,10 @@ async def monthly_product_with_benefit(
 @pytest_asyncio.fixture
 async def seat_org(save_fixture: SaveFixture, user: User) -> Organization:
     """Organization with seat-based pricing enabled, linked to the test user."""
+    account = await create_account(save_fixture, user)
     org = await create_organization(
         save_fixture,
+        account,
         feature_settings={"seat_based_pricing_enabled": True},
     )
     await save_fixture(UserOrganization(user=user, organization=org))

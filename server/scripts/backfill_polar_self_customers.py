@@ -1,17 +1,30 @@
-import asyncio
+import traceback
+import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
+import dramatiq
 import structlog
 import typer
 from rich.progress import Progress
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import String, cast, select
 
+from polar import tasks  # noqa: F401
+from polar.auth.models import AuthSubject
 from polar.config import settings
-from polar.integrations.polar.client import PolarSelfClient, PolarSelfClientError
+from polar.customer.schemas.customer import CustomerTeamCreate
+from polar.customer.service import customer as customer_service
+from polar.exceptions import PolarRequestValidationError
 from polar.kit.db.postgres import create_async_sessionmaker
-from polar.models import Organization, User, UserOrganization
-from polar.postgres import create_async_engine
+from polar.member.schemas import MemberOwnerCreate
+from polar.member.service import member_service
+from polar.models import Customer, Organization, Product, User, UserOrganization
+from polar.models.organization import OrganizationStatus
+from polar.postgres import AsyncSession, create_async_engine
+from polar.redis import Redis, create_redis
+from polar.subscription.schemas import SubscriptionCreateExternalCustomer
+from polar.subscription.service import subscription as subscription_service
+from polar.worker import JobQueueManager
 
 from .helper import configure_script_logging, typer_async
 
@@ -22,160 +35,286 @@ cli = typer.Typer()
 
 @dataclass
 class BackfillResult:
-    created: int = 0
+    customers_created: int = 0
+    members_created: int = 0
+    subscriptions_created: int = 0
+    skipped_no_members: int = 0
+    skipped_validation: int = 0
     errors: int = 0
-    members_created: list[tuple[str, str]] = field(default_factory=list)
+    error_details: list[tuple[str, str, str]] = field(default_factory=list)
+
+
+@dataclass
+class _OrganizationTally:
+    customers: int = 0
+    members: int = 0
+    subscriptions: int = 0
+
+
+async def _load_active_organizations(
+    session: AsyncSession,
+    *,
+    exclude_external_ids: set[str],
+    limit: int | None,
+) -> Sequence[Organization]:
+    statement = (
+        select(Organization)
+        .where(
+            Organization.deleted_at.is_(None),
+            Organization.status != OrganizationStatus.BLOCKED,
+        )
+        .order_by(Organization.created_at)
+    )
+    if exclude_external_ids:
+        statement = statement.where(
+            cast(Organization.id, String).notin_(exclude_external_ids)
+        )
+    if limit is not None:
+        statement = statement.limit(limit)
+    result = await session.execute(statement)
+    return result.scalars().all()
+
+
+async def _load_active_members(
+    session: AsyncSession, organization_id: uuid.UUID
+) -> Sequence[tuple[User, UserOrganization]]:
+    statement = (
+        select(User, UserOrganization)
+        .join(UserOrganization, UserOrganization.user_id == User.id)
+        .where(
+            UserOrganization.organization_id == organization_id,
+            UserOrganization.deleted_at.is_(None),
+            User.deleted_at.is_(None),
+        )
+        .order_by(UserOrganization.created_at)
+    )
+    result = await session.execute(statement)
+    return [(row[0], row[1]) for row in result.unique().all()]
+
+
+async def _load_existing_external_ids(
+    session: AsyncSession, self_org_id: uuid.UUID
+) -> set[str]:
+    statement = select(Customer.external_id).where(
+        Customer.organization_id == self_org_id,
+        Customer.external_id.is_not(None),
+    )
+    result = await session.execute(statement)
+    return {row[0] for row in result.all()}
+
+
+async def _backfill_organization(
+    session: AsyncSession,
+    *,
+    auth_subject: AuthSubject[Organization],
+    free_product: Product,
+    organization: Organization,
+    members: Sequence[tuple[User, UserOrganization]],
+) -> _OrganizationTally:
+    owner, _ = members[0]
+    tally = _OrganizationTally()
+
+    customer = await customer_service.create(
+        session,
+        CustomerTeamCreate.model_construct(
+            type="team",
+            email=None,
+            name=organization.name,
+            external_id=str(organization.id),
+            owner=MemberOwnerCreate.model_construct(
+                email=owner.email,
+                name=owner.public_name,
+                external_id=str(owner.id),
+            ),
+        ),
+        auth_subject,
+        created_at=organization.created_at,
+    )
+    tally.customers += 1
+    tally.members += 1
+
+    for user, user_org in members[1:]:
+        await member_service.create(
+            session,
+            auth_subject,
+            customer_id=customer.id,
+            email=user.email,
+            name=user.public_name,
+            external_id=str(user.id),
+            created_at=user_org.created_at,
+        )
+        tally.members += 1
+
+    await subscription_service.create(
+        session,
+        SubscriptionCreateExternalCustomer(
+            product_id=free_product.id,
+            external_customer_id=str(organization.id),
+        ),
+        auth_subject,
+        created_at=organization.created_at,
+    )
+    tally.subscriptions += 1
+
+    return tally
+
+
+BATCH_SIZE = 100
 
 
 async def run_backfill(
     *,
     session: AsyncSession,
-    client: PolarSelfClient,
-    delay_seconds: float = 0,
+    redis: Redis | None = None,
+    dry_run: bool = False,
     limit: int | None = None,
 ) -> BackfillResult:
-    statement = (
-        select(Organization)
-        .where(
-            Organization.deleted_at.is_(None),
-            Organization.blocked_at.is_(None),
-        )
-        .order_by(Organization.created_at)
+    result = BackfillResult()
+
+    self_org = await session.get(
+        Organization, uuid.UUID(settings.POLAR_ORGANIZATION_ID)
     )
-    if limit is not None:
-        statement = statement.limit(limit)
-    result = await session.execute(statement)
-    organizations = result.scalars().all()
-
-    backfill_result = BackfillResult()
-
-    for org in organizations:
-        members_stmt = (
-            select(User)
-            .join(UserOrganization, UserOrganization.user_id == User.id)
-            .where(
-                UserOrganization.organization_id == org.id,
-                UserOrganization.deleted_at.is_(None),
-            )
-            .order_by(UserOrganization.created_at)
+    if self_org is None:
+        raise RuntimeError(
+            f"Polar self organization {settings.POLAR_ORGANIZATION_ID} not found"
         )
-        members_result = await session.execute(members_stmt)
-        members = members_result.unique().scalars().all()
-        email = org.email or members[0].email
 
-        try:
-            await client.create_customer(
-                external_id=str(org.id),
-                email=email,
-                name=org.name,
-            )
-            await client.create_free_subscription(
-                external_customer_id=str(org.id),
-                product_id=settings.POLAR_FREE_PRODUCT_ID,
-            )
-            customer = await client.get_customer_by_external_id(str(org.id))
-            for member in members:
-                await client.add_member(
-                    customer_id=customer.id,
-                    email=member.email,
-                    name=member.public_name,
-                    external_id=str(member.id),
+    free_product = await session.get(Product, uuid.UUID(settings.POLAR_FREE_PRODUCT_ID))
+    if free_product is None:
+        raise RuntimeError(f"Free product {settings.POLAR_FREE_PRODUCT_ID} not found")
+
+    auth_subject: AuthSubject[Organization] = AuthSubject(
+        subject=self_org, scopes=set(), session=None
+    )
+
+    typer.echo("Loading existing Polar self customers...")
+    existing_external_ids = await _load_existing_external_ids(session, self_org.id)
+    typer.echo(f"  Found {len(existing_external_ids)} existing customers")
+
+    organizations = await _load_active_organizations(
+        session, exclude_external_ids=existing_external_ids, limit=limit
+    )
+    typer.echo(f"Loaded {len(organizations)} candidate organizations")
+
+    async def commit_and_flush() -> None:
+        await session.commit()
+        if redis is not None:
+            await JobQueueManager.get().flush(dramatiq.get_broker(), redis)
+
+    processed_in_batch = 0
+
+    with Progress() as progress:
+        task = progress.add_task(
+            "[cyan]Creating customers...", total=len(organizations)
+        )
+        for organization in organizations:
+            members = await _load_active_members(session, organization.id)
+            if not members:
+                log.warning(
+                    "backfill.skip_no_members",
+                    organization_id=str(organization.id),
                 )
-                backfill_result.members_created.append((str(org.id), str(member.id)))
-                if delay_seconds > 0:
-                    await asyncio.sleep(delay_seconds)
-            backfill_result.created += 1
-        except PolarSelfClientError:
-            backfill_result.errors += 1
-            log.error(
-                "backfill.create_customer_failed",
-                organization_id=str(org.id),
-            )
+                result.skipped_no_members += 1
+                progress.advance(task)
+                continue
 
-        if delay_seconds > 0:
-            await asyncio.sleep(delay_seconds)
+            if dry_run:
+                typer.echo(
+                    f"  Would create {organization.name} ({organization.id}) "
+                    f"owner={members[0][0].email} members={len(members)}"
+                )
+                progress.advance(task)
+                continue
 
-    return backfill_result
+            tally: _OrganizationTally | None = None
+            try:
+                async with session.begin_nested():
+                    tally = await _backfill_organization(
+                        session,
+                        auth_subject=auth_subject,
+                        free_product=free_product,
+                        organization=organization,
+                        members=members,
+                    )
+            except PolarRequestValidationError:
+                result.skipped_validation += 1
+            except Exception:
+                result.errors += 1
+                result.error_details.append(
+                    (
+                        str(organization.id),
+                        organization.name,
+                        traceback.format_exc(),
+                    )
+                )
+
+            if tally is not None:
+                result.customers_created += tally.customers
+                result.members_created += tally.members
+                result.subscriptions_created += tally.subscriptions
+
+            processed_in_batch += 1
+            if processed_in_batch >= BATCH_SIZE:
+                await commit_and_flush()
+                processed_in_batch = 0
+
+            progress.advance(task)
+
+        if not dry_run and processed_in_batch > 0:
+            await commit_and_flush()
+
+    return result
 
 
 @cli.command()
 @typer_async
 async def backfill(
     dry_run: bool = typer.Option(
-        True, help="Print what would be done without calling the API"
+        True, help="Print what would be done without creating records"
     ),
     limit: int | None = typer.Option(
         None, help="Maximum number of organizations to process"
     ),
-    delay_seconds: float = typer.Option(0.5, help="Seconds between API calls"),
 ) -> None:
-    """Backfill Polar customers, free subscriptions, and members for all active organizations."""
+    """Backfill Polar customers, members, and subscriptions for all active organizations."""
     configure_script_logging()
 
-    if not settings.POLAR_ACCESS_TOKEN:
-        typer.echo("POLAR_ACCESS_TOKEN is not configured, aborting.")
+    if not settings.POLAR_SELF_ENABLED:
+        typer.echo(
+            "POLAR_ACCESS_TOKEN, POLAR_ORGANIZATION_ID, or POLAR_FREE_PRODUCT_ID "
+            "is not configured, aborting."
+        )
         raise typer.Exit(1)
-
-    client = PolarSelfClient(
-        access_token=settings.POLAR_ACCESS_TOKEN,
-        api_url=settings.POLAR_API_URL,
-    )
 
     engine = create_async_engine("script")
     sessionmaker = create_async_sessionmaker(engine)
+    redis = create_redis("app")
 
     try:
-        async with sessionmaker() as session:
-            if dry_run:
-                statement = (
-                    select(Organization)
-                    .where(
-                        Organization.deleted_at.is_(None),
-                        Organization.blocked_at.is_(None),
-                    )
-                    .order_by(Organization.created_at)
-                )
-                if limit is not None:
-                    statement = statement.limit(limit)
-                result = await session.execute(statement)
-                organizations = result.scalars().all()
-                for org in organizations:
-                    members_stmt = (
-                        select(User)
-                        .join(
-                            UserOrganization,
-                            UserOrganization.user_id == User.id,
-                        )
-                        .where(
-                            UserOrganization.organization_id == org.id,
-                            UserOrganization.deleted_at.is_(None),
-                        )
-                    )
-                    members_result = await session.execute(members_stmt)
-                    members = members_result.unique().scalars().all()
-                    email = org.email or members[0].email
-                    typer.echo(
-                        f"  Would create customer: {org.name} ({org.id}) email={email} members={len(members)}"
-                    )
-                return
-
-            with Progress() as progress:
-                task = progress.add_task("[cyan]Backfilling customers...", total=1)
-                backfill_result = await run_backfill(
-                    session=session,
-                    client=client,
-                    delay_seconds=delay_seconds,
-                    limit=limit,
-                )
-                progress.update(task, advance=1)
-
-            typer.echo(
-                f"\nDone: {backfill_result.created} created, "
-                f"{backfill_result.errors} errors, "
-                f"{len(backfill_result.members_created)} members created"
+        async with (
+            JobQueueManager.open(dramatiq.get_broker(), redis),
+            sessionmaker() as session,
+        ):
+            result = await run_backfill(
+                session=session, redis=redis, dry_run=dry_run, limit=limit
             )
 
+        typer.echo(
+            f"\nDone: {result.customers_created} customers, "
+            f"{result.members_created} members, "
+            f"{result.subscriptions_created} subscriptions, "
+            f"{result.skipped_no_members} skipped (no members), "
+            f"{result.skipped_validation} skipped (validation conflict), "
+            f"{result.errors} errors"
+        )
+        if result.error_details:
+            typer.echo("\nErrors:")
+            for org_id, org_name, tb in result.error_details:
+                typer.echo(f"\n  {org_name} ({org_id}):")
+                for line in tb.rstrip().splitlines():
+                    typer.echo(f"    {line}")
     finally:
+        await redis.aclose()  # type: ignore[attr-defined]
         await engine.dispose()
 
 

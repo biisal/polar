@@ -12,7 +12,19 @@ from polar.kit.schemas import Schema
 if TYPE_CHECKING:
     from pydantic_ai.usage import RunUsage as Usage
 
-# --- Review context ---
+# --- Review enums ---
+
+
+class ActorType(StrEnum):
+    AGENT = "agent"
+    HUMAN = "human"
+
+
+class DecisionType(StrEnum):
+    APPROVE = "APPROVE"
+    DENY = "DENY"
+    ESCALATE = "ESCALATE"
+    SNOOZE = "SNOOZE"
 
 
 class ReviewContext(StrEnum):
@@ -20,6 +32,7 @@ class ReviewContext(StrEnum):
     SETUP_COMPLETE = "setup_complete"  # Review when account setup is complete
     THRESHOLD = "threshold"  # Following reviews when payment threshold hit
     MANUAL = "manual"  # Full manual review triggered from backoffice
+    APPEAL = "appeal"  # Appeal of a previous denial
 
 
 # --- Shared utility schemas ---
@@ -79,7 +92,7 @@ class OrganizationData(Schema):
     socials: list[dict[str, str]] = Field(default_factory=list)
     created_at: datetime | None = None
     details_submitted_at: datetime | None = None
-    blocked_at: datetime | None = None
+    is_blocked: bool = False
 
 
 class ProductData(Schema):
@@ -142,7 +155,7 @@ class PriorOrganization(Schema):
     status: str
     review_verdict: str | None = None
     appeal_decision: str | None = None
-    blocked_at: datetime | None = None
+    is_blocked: bool = False
 
 
 class HistoryData(Schema):
@@ -403,6 +416,7 @@ class AgentReviewResult(Schema):
     report: ReviewAgentReport
     data_snapshot: DataSnapshot
     model_used: str
+    model_provider: str
     duration_seconds: float
     usage: UsageInfo = Field(default_factory=UsageInfo)
     timed_out: bool = False

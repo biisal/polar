@@ -5,6 +5,7 @@ from sqlalchemy import Select, func
 from sqlalchemy.orm import joinedload
 
 from polar.exceptions import PolarError
+from polar.integrations.polar.service import polar_self as polar_self_service
 from polar.kit.utils import utc_now
 from polar.models import UserOrganization
 from polar.postgres import AsyncReadSession, AsyncSession, sql
@@ -111,6 +112,7 @@ class UserOrganizationService:
     async def remove_member(
         self,
         session: AsyncSession,
+        *,
         user_id: UUID,
         organization_id: UUID,
     ) -> None:
@@ -122,12 +124,20 @@ class UserOrganizationService:
                 UserOrganization.is_deleted.is_(False),
             )
             .values(deleted_at=utc_now())
+            .returning(UserOrganization.user_id)
         )
-        await session.execute(stmt)
+        result = await session.execute(stmt)
+        removed_user_id = result.scalar_one_or_none()
+        if removed_user_id is not None:
+            polar_self_service.enqueue_remove_member(
+                external_customer_id=str(organization_id),
+                external_id=str(user_id),
+            )
 
     async def remove_member_safe(
         self,
         session: AsyncSession,
+        *,
         user_id: UUID,
         organization_id: UUID,
     ) -> None:
@@ -153,13 +163,16 @@ class UserOrganizationService:
             raise UserNotMemberOfOrganization(user_id, organization_id)
 
         # Check if the user is the organization admin
-        if organization.account_id:
-            admin_user = await org_repo.get_admin_user(session, organization)
-            if admin_user and admin_user.id == user_id:
-                raise CannotRemoveOrganizationAdmin(user_id, organization_id)
+        admin_user = await org_repo.get_admin_user(session, organization)
+        if admin_user and admin_user.id == user_id:
+            raise CannotRemoveOrganizationAdmin(user_id, organization_id)
 
         # Remove the member
-        await self.remove_member(session, user_id, organization_id)
+        await self.remove_member(
+            session,
+            user_id=user_id,
+            organization_id=organization_id,
+        )
 
     def _get_list_by_user_id_query(
         self, user_id: UUID, ordered: bool = True

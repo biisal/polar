@@ -168,12 +168,15 @@ const CheckoutPricingBreakdown = ({
           {seatRows?.map((row, i) => (
             <DetailRow
               key={i}
-              title={`${row.seats} ${row.seats === 1 ? 'seat' : 'seats'}`}
+              title={t('checkout.pricing.seats.count', { count: row.seats })}
               subtitle={
-                formatCurrency('compact', locale)(
+                '· ' +
+                formatCurrency('standard', locale)(
                   row.pricePerSeat,
                   checkout.currency!,
-                ) + ' per seat'
+                ) +
+                ' ' +
+                t('checkout.pricing.perSeat')
               }
               className="text-gray-600"
             >
@@ -192,7 +195,12 @@ const CheckoutPricingBreakdown = ({
             className="text-gray-600"
           >
             <AmountLabel
-              amount={checkout.amount}
+              amount={
+                checkout.tax_behavior === 'inclusive' &&
+                checkout.tax_amount !== null
+                  ? checkout.total_amount - checkout.tax_amount
+                  : checkout.amount
+              }
               currency={checkout.currency}
               interval={interval}
               intervalCount={intervalCount}
@@ -226,7 +234,11 @@ const CheckoutPricingBreakdown = ({
           )}
 
           <DetailRow
-            title={t('checkout.pricing.taxes')}
+            title={
+              checkout.tax_behavior === 'inclusive'
+                ? t('checkout.pricing.inclTax')
+                : t('checkout.pricing.taxes')
+            }
             className="text-gray-600"
           >
             {checkout.tax_amount !== null

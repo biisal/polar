@@ -38,6 +38,7 @@ const AUTHENTICATED_ROUTES = [
   new RegExp('^/finance(/.*)?'),
   new RegExp('^/settings(/.*)?'),
   new RegExp('^/oauth2(/.*)?'),
+  new RegExp('^/to(/.*)?'),
 ]
 
 const getOrCreateDistinctId = (
@@ -260,6 +261,7 @@ export const config = {
     /*
      * Match all request paths except for the ones starting with:
      * - api (API routes)
+     * - fonts (static font files)
      * - ingest (Posthog)
      * - monitoring (Sentry)
      * - docs, _mintlify, mintlify-assets (Mintlify)
@@ -267,6 +269,6 @@ export const config = {
      * - _next/image (image optimization files)
      * - favicon.ico, sitemap.xml, robots.txt (metadata files)
      */
-    '/((?!api|ingest|monitoring|docs|_mintlify|mintlify-assets|_next/static|_next/image|favicon.ico|sitemap.xml|robots.txt).*)',
+    '/((?!api|fonts|ingest|monitoring|docs|_mintlify|mintlify-assets|_next/static|_next/image|favicon.ico|sitemap.xml|robots.txt).*)',
   ],
 }

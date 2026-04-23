@@ -11,6 +11,7 @@ from sqlalchemy.sql.expression import ColumnExpressionArgument
 
 from polar.config import settings
 from polar.kit.db.postgres import AsyncReadSession, AsyncSession
+from polar.kit.pagination import count_subquery
 from polar.kit.sorting import Sorting
 from polar.kit.utils import utc_now
 
@@ -57,7 +58,7 @@ class RepositoryProtocol[M](Protocol):
     ) -> M: ...
 
 
-class RepositoryBase[M]:
+class RepositoryBase[M: ModelIDProtocol[Any]]:
     model: type[M]
 
     def __init__(self, session: AsyncSession | AsyncReadSession) -> None:
@@ -107,9 +108,7 @@ class RepositoryBase[M]:
     ) -> tuple[list[M], int]:
         offset = (page - 1) * limit
 
-        count_statement = select(func.count()).select_from(
-            statement.order_by(None).subquery()
-        )
+        count_statement = select(func.count()).select_from(count_subquery(statement))
         count_result = await self.session.execute(count_statement)
         count = count_result.scalar_one()
 

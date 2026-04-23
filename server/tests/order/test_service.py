@@ -26,7 +26,6 @@ from polar.enums import (
 from polar.event.repository import EventRepository
 from polar.event.system import SystemEvent
 from polar.exceptions import PolarRequestValidationError
-from polar.held_balance.service import held_balance as held_balance_service
 from polar.integrations.stripe.service import StripeService
 from polar.kit.address import (
     Address,
@@ -2121,36 +2120,7 @@ class TestCreateOrderBalance:
         with pytest.raises(PaymentTransactionForChargeDoesNotExist):
             await order_service.create_order_balance(session, order, "CHARGE_ID")
 
-    async def test_no_account(
-        self,
-        save_fixture: SaveFixture,
-        session: AsyncSession,
-        product: Product,
-        customer: Customer,
-    ) -> None:
-        order = await create_order(save_fixture, product=product, customer=customer)
-        payment_transaction = await create_transaction(
-            save_fixture, type=TransactionType.payment, charge_id="CHARGE_ID"
-        )
-
-        await order_service.create_order_balance(session, order, "CHARGE_ID")
-
-        held_balance = await held_balance_service.get_by(
-            session, organization_id=product.organization_id
-        )
-        assert held_balance is not None
-        assert held_balance.order_id == order.id
-
-        updated_payment_transaction = await payment_transaction_service.get(
-            session,
-            id=payment_transaction.id,
-            options=(joinedload(Transaction.payment_customer),),
-        )
-        assert updated_payment_transaction is not None
-        assert updated_payment_transaction.order == order
-        assert updated_payment_transaction.payment_customer == order.customer
-
-    async def test_with_account(
+    async def test_valid(
         self,
         mocker: MockerFixture,
         save_fixture: SaveFixture,
@@ -2251,6 +2221,7 @@ class TestCreateOrderBalance:
 class TestSendConfirmationEmail:
     async def test_billing_not_set(
         self,
+        mocker: MockerFixture,
         enqueue_email_mock: MagicMock,
         save_fixture: SaveFixture,
         session: AsyncSession,
@@ -2258,6 +2229,10 @@ class TestSendConfirmationEmail:
         customer: Customer,
         organization: Organization,
     ) -> None:
+        create_order_invoice_mock = mocker.patch(
+            "polar.order.service.invoice_service.create_order_invoice",
+            new_callable=AsyncMock,
+        )
         order = await create_order(
             save_fixture,
             product=product,
@@ -2267,6 +2242,7 @@ class TestSendConfirmationEmail:
         await order_service.send_confirmation_email(session, order)
 
         assert order.invoice_path is None
+        create_order_invoice_mock.assert_not_called()
         enqueue_email_mock.assert_called_once()
         assert isinstance(enqueue_email_mock.call_args[0][0], OrderConfirmationEmail)
         attachments = enqueue_email_mock.call_args[1]["attachments"]
@@ -2274,6 +2250,7 @@ class TestSendConfirmationEmail:
 
     async def test_billing_set(
         self,
+        mocker: MockerFixture,
         enqueue_email_mock: MagicMock,
         save_fixture: SaveFixture,
         session: AsyncSession,
@@ -2281,6 +2258,16 @@ class TestSendConfirmationEmail:
         customer: Customer,
         organization: Organization,
     ) -> None:
+        create_order_invoice_mock = mocker.patch(
+            "polar.order.service.invoice_service.create_order_invoice",
+            new_callable=AsyncMock,
+            return_value="invoices/mock-invoice.pdf",
+        )
+        get_order_invoice_url_mock = mocker.patch(
+            "polar.order.service.invoice_service.get_order_invoice_url",
+            new_callable=AsyncMock,
+            return_value=("https://mock-s3/invoices/mock-invoice.pdf", utc_now()),
+        )
         order = await create_order(
             save_fixture,
             product=product,
@@ -2292,6 +2279,8 @@ class TestSendConfirmationEmail:
         await order_service.send_confirmation_email(session, order)
 
         assert order.invoice_path is not None
+        create_order_invoice_mock.assert_called_once_with(order)
+        get_order_invoice_url_mock.assert_called_once()
         enqueue_email_mock.assert_called_once()
         assert isinstance(enqueue_email_mock.call_args[0][0], OrderConfirmationEmail)
         attachments = enqueue_email_mock.call_args[1]["attachments"]
@@ -3512,7 +3501,7 @@ class TestTriggerPayment:
             status=OrderStatus.pending,
         )
 
-        organization.status = OrganizationStatus.DENIED
+        organization.set_status(OrganizationStatus.DENIED)
         await save_fixture(organization)
 
         await order_service.trigger_payment(session, order, payment_method)
@@ -3537,7 +3526,7 @@ class TestTriggerPayment:
             status=OrderStatus.pending,
         )
 
-        organization.blocked_at = utc_now()
+        organization.set_status(OrganizationStatus.BLOCKED)
         await save_fixture(organization)
 
         await order_service.trigger_payment(session, order, payment_method)

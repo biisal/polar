@@ -1,6 +1,7 @@
 import builtins
 import uuid
 from collections.abc import Sequence
+from datetime import datetime, timedelta
 from typing import Any
 
 import structlog
@@ -8,9 +9,9 @@ from pydantic import TypeAdapter
 from sqlalchemy import UnaryExpression, asc, desc, func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import joinedload
-from sqlalchemy_utils.types.range import timedelta
 
 from polar.auth.models import AuthSubject
+from polar.authz.service import get_accessible_org_ids
 from polar.benefit.grant.repository import BenefitGrantRepository
 from polar.customer_meter.repository import CustomerMeterRepository
 from polar.customer_session.service import customer_session as customer_session_service
@@ -74,7 +75,8 @@ class CustomerService:
         ],
     ) -> tuple[Sequence[Customer], int]:
         repository = CustomerRepository.from_session(session)
-        statement = repository.get_readable_statement(auth_subject)
+        org_ids = await get_accessible_org_ids(session, auth_subject)
+        statement = repository.get_statement_by_org_ids(org_ids)
 
         if organization_id is not None:
             statement = statement.where(Customer.organization_id.in_(organization_id))
@@ -116,7 +118,8 @@ class CustomerService:
         id: uuid.UUID,
     ) -> Customer | None:
         repository = CustomerRepository.from_session(session)
-        statement = repository.get_readable_statement(auth_subject).where(
+        org_ids = await get_accessible_org_ids(session, auth_subject)
+        statement = repository.get_statement_by_org_ids(org_ids).where(
             Customer.id == id
         )
         return await repository.get_one_or_none(statement)
@@ -128,7 +131,8 @@ class CustomerService:
         external_id: str,
     ) -> Customer | None:
         repository = CustomerRepository.from_session(session)
-        statement = repository.get_readable_statement(auth_subject).where(
+        org_ids = await get_accessible_org_ids(session, auth_subject)
+        statement = repository.get_statement_by_org_ids(org_ids).where(
             Customer.external_id == external_id
         )
         return await repository.get_one_or_none(statement)
@@ -138,6 +142,8 @@ class CustomerService:
         session: AsyncSession,
         customer_create: CustomerIndividualCreate | CustomerTeamCreate,
         auth_subject: AuthSubject[User | Organization],
+        *,
+        created_at: datetime | None = None,
     ) -> Customer:
         organization = await get_payload_organization(
             session, auth_subject, customer_create
@@ -215,6 +221,8 @@ class CustomerService:
             ),
             tax_id=validated_tax_id,
         )
+        if created_at is not None:
+            customer_obj.created_at = created_at
 
         return await self._persist_customer(
             session,
@@ -338,7 +346,6 @@ class CustomerService:
     ) -> Customer:
         repository = CustomerRepository.from_session(session)
 
-        old_email = customer.email
         email_changed = False
 
         errors: list[ValidationError] = []
@@ -490,30 +497,8 @@ class CustomerService:
                 ) from e
             raise
 
-        # Sync owner member email when the customer email changes.
-        # Only applies to individual customers (type == individual or type is None).
-        # Team customers can have multiple members with different emails — we don't auto-sync.
-        if email_changed and old_email is not None:
-            customer_type = updated_customer.type or CustomerType.individual
-
-            if customer_type == CustomerType.individual:
-                member_repository = MemberRepository.from_session(session)
-                owner = await member_repository.get_owner_by_customer_id(
-                    session, updated_customer.id
-                )
-
-                if owner is not None and owner.email.lower() == old_email.lower():
-                    new_email = updated_customer.email
-
-                    await member_repository.update(
-                        owner, update_dict={"email": new_email}
-                    )
-                    log.info(
-                        "member.email_sync",
-                        customer_id=updated_customer.id,
-                        member_id=owner.id,
-                        new_email=new_email,
-                    )
+        if email_changed:
+            await member_service.sync_owner_email(session, updated_customer)
 
         return updated_customer
 

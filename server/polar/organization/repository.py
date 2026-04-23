@@ -1,10 +1,10 @@
 from collections.abc import Sequence
 from uuid import UUID
 
-from sqlalchemy import Select, func, or_, select, update
+from sqlalchemy import Select, func, select, update
 from sqlalchemy.orm import joinedload
 
-from polar.auth.models import AuthSubject, is_organization, is_user
+from polar.authz.types import AccessibleOrganizationID
 from polar.kit.repository import (
     RepositoryBase,
     RepositorySoftDeletionIDMixin,
@@ -18,6 +18,7 @@ from polar.models import (
     Customer,
     Order,
     Organization,
+    PayoutAccount,
     Subscription,
     User,
     UserOrganization,
@@ -28,6 +29,7 @@ from polar.models.discount import (
     DiscountPercentage,
     DiscountType,
 )
+from polar.models.organization import OrganizationStatus
 from polar.models.organization_review import OrganizationReview
 from polar.models.subscription import SubscriptionStatus
 from polar.postgres import AsyncReadSession
@@ -58,8 +60,26 @@ class OrganizationRepository(
         )
 
         if not include_blocked:
-            statement = statement.where(self.model.blocked_at.is_(None))
+            statement = statement.where(self.model.status != OrganizationStatus.BLOCKED)
 
+        return await self.get_one_or_none(statement)
+
+    async def get_by_account(self, account_id: UUID) -> Organization | None:
+        """Get the organization that owns the given account."""
+        statement = self.get_base_statement().where(
+            Organization.account_id == account_id,
+            Organization.status != OrganizationStatus.BLOCKED,
+        )
+        return await self.get_one_or_none(statement)
+
+    async def get_by_payout_account(
+        self, payout_account_id: UUID
+    ) -> Organization | None:
+        """Get the organization that uses the given payout account."""
+        statement = self.get_base_statement().where(
+            Organization.payout_account_id == payout_account_id,
+            Organization.status != OrganizationStatus.BLOCKED,
+        )
         return await self.get_one_or_none(statement)
 
     async def get_by_id_with_payout_account(
@@ -71,12 +91,16 @@ class OrganizationRepository(
     ) -> Organization | None:
         statement = (
             self.get_base_statement(include_deleted=include_deleted)
-            .options(joinedload(Organization.payout_account))
+            .options(
+                joinedload(Organization.payout_account).subqueryload(
+                    PayoutAccount.admin
+                )
+            )
             .where(self.model.id == id)
         )
 
         if not include_blocked:
-            statement = statement.where(self.model.blocked_at.is_(None))
+            statement = statement.where(self.model.status != OrganizationStatus.BLOCKED)
 
         return await self.get_one_or_none(statement)
 
@@ -115,7 +139,7 @@ class OrganizationRepository(
             .where(
                 UserOrganization.user_id == user,
                 UserOrganization.is_deleted.is_(False),
-                Organization.blocked_at.is_(None),
+                Organization.status != OrganizationStatus.BLOCKED,
             )
         )
         return await self.get_all(statement)
@@ -127,7 +151,7 @@ class OrganizationRepository(
             self.get_base_statement()
             .where(
                 Organization.account_id == account,
-                Organization.blocked_at.is_(None),
+                Organization.status != OrganizationStatus.BLOCKED,
             )
             .options(*options)
         )
@@ -156,35 +180,18 @@ class OrganizationRepository(
                     / 86400
                 )
 
-    def get_readable_statement(
-        self, auth_subject: AuthSubject[User | Organization]
+    def get_statement_by_org_ids(
+        self, org_ids: set[AccessibleOrganizationID]
     ) -> Select[tuple[Organization]]:
-        statement = self.get_base_statement().where(Organization.blocked_at.is_(None))
-
-        if is_user(auth_subject):
-            user = auth_subject.subject
-            statement = statement.where(
-                Organization.id.in_(
-                    select(UserOrganization.organization_id).where(
-                        UserOrganization.user_id == user.id,
-                        UserOrganization.is_deleted.is_(False),
-                    )
-                )
-            )
-        elif is_organization(auth_subject):
-            statement = statement.where(
-                Organization.id == auth_subject.subject.id,
-            )
-
-        return statement
+        return self.get_base_statement().where(
+            Organization.id.in_(org_ids),
+            Organization.status != OrganizationStatus.BLOCKED,
+        )
 
     async def get_admin_user(
         self, session: AsyncReadSession, organization: Organization
     ) -> User | None:
         """Get the admin user of the organization from the associated account."""
-        if not organization.account_id:
-            return None
-
         statement = (
             select(User)
             .join(Account, Account.admin_id == User.id)
@@ -195,20 +202,6 @@ class OrganizationRepository(
         )
         result = await session.execute(statement)
         return result.unique().scalar_one_or_none()
-
-    async def enable_revops(self, organization_ids: set[UUID]) -> None:
-        statement = self.get_base_statement().where(
-            Organization.id.in_(organization_ids),
-            or_(
-                Organization.feature_settings["revops_enabled"].is_(None),
-                Organization.feature_settings["revops_enabled"].as_boolean().is_(False),
-            ),
-        )
-        orgs = await self.get_all(statement)
-        for org in orgs:
-            org.feature_settings = {**org.feature_settings, "revops_enabled": True}
-            self.session.add(org)
-        await self.session.flush()
 
     async def count_paid_orders_by_organization(self, organization_id: UUID) -> int:
         """Count non-zero orders for all customers of this organization.
@@ -290,6 +283,30 @@ class OrganizationRepository(
             .values(payout_account_id=None)
         )
         await self.session.execute(stmt)
+
+    async def get_all_by_payout_account(
+        self, payout_account: UUID
+    ) -> Sequence[Organization]:
+        statement = self.get_base_statement().where(
+            Organization.payout_account_id == payout_account,
+        )
+        return await self.get_all(statement)
+
+    async def get_all_by_payout_account_admin(
+        self, user_id: UUID
+    ) -> Sequence[Organization]:
+        statement = (
+            self.get_base_statement()
+            .join(
+                PayoutAccount,
+                PayoutAccount.id == Organization.payout_account_id,
+            )
+            .where(
+                PayoutAccount.admin_id == user_id,
+                PayoutAccount.deleted_at.is_(None),
+            )
+        )
+        return await self.get_all(statement)
 
 
 class OrganizationReviewRepository(RepositoryBase[OrganizationReview]):

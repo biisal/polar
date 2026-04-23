@@ -79,12 +79,12 @@ jobs:
           POLICY_FILE: policy.json
         run: bash github.sh
 
-      - uses: pnpm/action-setup@v5
+      - uses: pnpm/action-setup@v6
         with:
           package_json_file: server/emails/package.json
 
       - name: 📬 Setup Node.js environment for server/emails
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v6.3.0
         with:
           node-version-file: server/emails/.node-version
           cache: "pnpm"
@@ -95,7 +95,7 @@ jobs:
         run: pnpm install --frozen-lockfile && pnpm build
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@v8.0.0
         with:
           enable-cache: true
 

@@ -5,6 +5,7 @@ on:
     branches: ["main"]
   pull_request:
     types: [opened, synchronize, edited]
+  merge_group:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -49,12 +50,12 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v6
 
-      - uses: pnpm/action-setup@v5
+      - uses: pnpm/action-setup@v6
         with:
           package_json_file: clients/package.json
 
       - name: Setup Node.js environment
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v6.3.0
         with:
           node-version-file: clients/.node-version
           cache: "pnpm"
@@ -69,11 +70,17 @@ jobs:
       - name: 💅 Lint
         run: pnpm run lint
 
+      - name: 🌍 Validate i18n
+        run: pnpm --filter @polar-sh/i18n validate
+
       - name: 👀 Typecheck
         run: pnpm run typecheck
 
       - name: "🧪 Test: App"
         run: pnpm --filter @polar-sh/app test
+
+      - name: "🧪 Test: Web"
+        run: pnpm --filter web test
 
       - name: "🧪 Test: @polar-sh/currency"
         run: pnpm --filter @polar-sh/currency test

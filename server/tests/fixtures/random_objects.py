@@ -110,7 +110,7 @@ from polar.models.event import EventSource
 from polar.models.member import MemberRole
 from polar.models.notification_recipient import NotificationRecipient
 from polar.models.order import OrderBillingReasonInternal, OrderStatus
-from polar.models.organization import OrganizationStatus
+from polar.models.organization import STATUS_CAPABILITIES, OrganizationStatus
 from polar.models.payment import PaymentStatus, PaymentTrigger
 from polar.models.payout import PayoutStatus
 from polar.models.payout_attempt import PayoutAttemptStatus
@@ -139,8 +139,43 @@ def lstr(suffix: str) -> str:
     return "".join(random.choices(string.ascii_uppercase + string.digits, k=6)) + suffix
 
 
+async def create_account(
+    save_fixture: SaveFixture,
+    user: User,
+    *,
+    currency: str = "usd",
+    processor_fees_applicable: bool = True,
+    fee_basis_points: int | None = None,
+    fee_fixed: int | None = None,
+    billing_name: str | None = None,
+    billing_address: Address | None = None,
+) -> Account:
+    account = Account(
+        admin_id=user.id,
+        currency=currency,
+        processor_fees_applicable=processor_fees_applicable,
+        _platform_fee_percent=fee_basis_points,
+        _platform_fee_fixed=fee_fixed,
+        billing_name=billing_name,
+        billing_address=billing_address,
+    )
+    await save_fixture(account)
+    return account
+
+
+@pytest_asyncio.fixture
+async def account(save_fixture: SaveFixture, user: User) -> Account:
+    return await create_account(save_fixture, user)
+
+
+@pytest_asyncio.fixture
+async def account_second(save_fixture: SaveFixture, user: User) -> Account:
+    return await create_account(save_fixture, user)
+
+
 async def create_organization(
     save_fixture: SaveFixture,
+    account: Account,
     name_prefix: str = "testorg",
     status: OrganizationStatus = OrganizationStatus.ACTIVE,
     **kwargs: Any,
@@ -157,27 +192,28 @@ async def create_organization(
         status=status,
         customer_invoice_prefix=name.upper(),
         avatar_url="https://avatars.githubusercontent.com/u/105373340?s=200&v=4",
-        account=None,
+        account=account,
         payout_account=None,
         **kwargs,
     )
+    # Set capabilities directly (not via ``set_status``) to avoid stamping
+    # ``status_updated_at`` on fixtures.
+    if "capabilities" not in kwargs:
+        organization.capabilities = {**STATUS_CAPABILITIES[status]}
     await save_fixture(organization)
     return organization
 
 
 @pytest_asyncio.fixture
-async def organization(save_fixture: SaveFixture) -> Organization:
-    return await create_organization(save_fixture)
+async def organization(save_fixture: SaveFixture, account: Account) -> Organization:
+    return await create_organization(save_fixture, account)
 
 
 @pytest_asyncio.fixture
-async def organization_second(save_fixture: SaveFixture) -> Organization:
-    return await create_organization(save_fixture)
-
-
-@pytest_asyncio.fixture
-async def second_organization(save_fixture: SaveFixture) -> Organization:
-    return await create_organization(save_fixture)
+async def organization_second(
+    save_fixture: SaveFixture, account_second: Account
+) -> Organization:
+    return await create_organization(save_fixture, account_second)
 
 
 async def create_oauth_account(
@@ -2076,40 +2112,6 @@ async def create_payout(
     await save_fixture(payout)
 
     return payout
-
-
-async def create_account(
-    save_fixture: SaveFixture,
-    organization: Organization,
-    user: User,
-    *,
-    currency: str = "usd",
-    processor_fees_applicable: bool = True,
-    fee_basis_points: int | None = None,
-    fee_fixed: int | None = None,
-    billing_name: str | None = None,
-    billing_address: Address | None = None,
-) -> Account:
-    account = Account(
-        admin_id=user.id,
-        currency=currency,
-        processor_fees_applicable=processor_fees_applicable,
-        _platform_fee_percent=fee_basis_points,
-        _platform_fee_fixed=fee_fixed,
-        billing_name=billing_name,
-        billing_address=billing_address,
-    )
-    await save_fixture(account)
-    organization.account = account
-    await save_fixture(organization)
-    return account
-
-
-@pytest_asyncio.fixture
-async def account(
-    save_fixture: SaveFixture, organization: Organization, user: User
-) -> Account:
-    return await create_account(save_fixture, organization, user)
 
 
 async def create_payout_account(

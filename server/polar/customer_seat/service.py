@@ -9,6 +9,7 @@ import structlog
 from sqlalchemy import inspect as sa_inspect
 
 from polar.auth.models import AuthSubject
+from polar.authz.service import get_accessible_org_ids
 from polar.customer.repository import CustomerRepository
 from polar.customer_seat.sender import send_seat_invitation_email
 from polar.customer_session.service import (
@@ -306,7 +307,11 @@ class SeatService:
         organization_repository = OrganizationRepository.from_session(session)
         organization = await organization_repository.get_by_id(organization_id)
 
-        if external_member_id or member_id:
+        member_model_enabled = (
+            organization is not None and organization.is_member_model_enabled
+        )
+
+        if member_model_enabled or external_member_id or member_id:
             target = await self._resolve_member_model_target(
                 session,
                 repository,
@@ -490,9 +495,7 @@ class SeatService:
         # Both paths use seat.customer_id, but it points to different customers:
         # - member_model: billing customer (purchaser)
         # - legacy: seat member's customer
-        member_model_enabled = organization.feature_settings.get(
-            "member_model_enabled", False
-        )
+        member_model_enabled = organization.is_member_model_enabled
 
         if member_model_enabled:
             # Load billing customer for session
@@ -596,9 +599,7 @@ class SeatService:
         await self.check_seat_feature_enabled(session, organization_id)
 
         # Check feature flag
-        member_model_enabled = organization.feature_settings.get(
-            "member_model_enabled", False
-        )
+        member_model_enabled = organization.is_member_model_enabled
 
         # Capture customer_id and member_id before clearing to avoid race condition
         original_customer_id = seat.customer_id
@@ -658,9 +659,10 @@ class SeatService:
         seat_id: uuid.UUID,
     ) -> CustomerSeat | None:
         repository = CustomerSeatRepository.from_session(session)
+        org_ids = await get_accessible_org_ids(session, auth_subject)
 
-        seat = await repository.get_by_id_and_auth_subject(
-            auth_subject,
+        seat = await repository.get_by_id_and_org_ids(
+            org_ids,
             seat_id,
             options=repository.get_eager_options(),
         )

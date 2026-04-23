@@ -88,6 +88,21 @@ export default {
           _mode: 'plural',
         },
       },
+      perSeat: 'por utilizador',
+      seats: {
+        label: 'Licenças',
+        numberOfSeats: 'Número de licenças',
+        count: {
+          '=1': '# licença',
+          other: '# licenças',
+          _mode: 'plural',
+        },
+        range: '{min} - {max} licenças',
+        minimum: 'Mínimo de {min} licenças',
+        maximum: 'Máximo de {max} licenças',
+        updateFailed: 'Não foi possível atualizar as licenças',
+      },
+      inclTax: 'IVA (incluído)',
     },
     trial: {
       ends: 'Teste termina a {endDate}',

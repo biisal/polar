@@ -1,9 +1,10 @@
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Literal, Self, TypedDict
+from typing import TYPE_CHECKING, Annotated, Any, Literal, NotRequired, Self, TypedDict
 from urllib.parse import urlparse
 from uuid import UUID
 
+from pydantic.json_schema import WithJsonSchema
 from sqlalchemy import (
     TIMESTAMP,
     BigInteger,
@@ -24,7 +25,6 @@ from sqlalchemy.orm import Mapped, declared_attr, mapped_column, relationship
 from polar.config import settings
 from polar.enums import (
     InvoiceNumbering,
-    PublicSubscriptionProrationBehavior,
     SubscriptionProrationBehavior,
     TaxBehaviorOption,
 )
@@ -83,7 +83,16 @@ _default_notification_settings: OrganizationNotificationSettings = {
 
 class OrganizationSubscriptionSettings(TypedDict):
     allow_multiple_subscriptions: bool
-    proration_behavior: PublicSubscriptionProrationBehavior
+    proration_behavior: Annotated[
+        SubscriptionProrationBehavior,
+        WithJsonSchema(
+            {
+                "enum": ["invoice", "prorate", "next_period"],
+                "title": "PublicSubscriptionProrationBehavior",
+                "type": "string",
+            }
+        ),
+    ]
     benefit_revocation_grace_period: int
     prevent_trial_abuse: bool
     # Legacy - to be removed separately
@@ -146,9 +155,14 @@ class CustomerPortalSubscriptionSettings(TypedDict):
     update_plan: bool
 
 
+class CustomerPortalCustomerSettings(TypedDict):
+    allow_email_change: NotRequired[bool]
+
+
 class OrganizationCustomerPortalSettings(TypedDict):
     usage: CustomerPortalUsageSettings
     subscription: CustomerPortalSubscriptionSettings
+    customer: NotRequired[CustomerPortalCustomerSettings]
 
 
 _default_customer_portal_settings: OrganizationCustomerPortalSettings = {
@@ -156,6 +170,9 @@ _default_customer_portal_settings: OrganizationCustomerPortalSettings = {
     "subscription": {
         "update_seats": True,
         "update_plan": True,
+    },
+    "customer": {
+        "allow_email_change": False,
     },
 }
 
@@ -185,33 +202,203 @@ OrganizationLegalEntity = (
 
 class OrganizationStatus(StrEnum):
     CREATED = "created"
-    ONBOARDING_STARTED = "onboarding_started"
-    INITIAL_REVIEW = "initial_review"
-    ONGOING_REVIEW = "ongoing_review"
+    REVIEW = "review"
+    SNOOZED = "snoozed"
     DENIED = "denied"
     ACTIVE = "active"
+    BLOCKED = "blocked"
+    OFFBOARDING = "offboarding"
 
     def get_display_name(self) -> str:
         return {
             OrganizationStatus.CREATED: "Created",
-            OrganizationStatus.ONBOARDING_STARTED: "Onboarding Started",
-            OrganizationStatus.INITIAL_REVIEW: "Initial Review",
-            OrganizationStatus.ONGOING_REVIEW: "Ongoing Review",
+            OrganizationStatus.REVIEW: "Review",
+            OrganizationStatus.SNOOZED: "Snoozed",
             OrganizationStatus.DENIED: "Denied",
             OrganizationStatus.ACTIVE: "Active",
+            OrganizationStatus.BLOCKED: "Blocked",
+            OrganizationStatus.OFFBOARDING: "Offboarding",
         }[self]
 
     @classmethod
     def review_statuses(cls) -> set[Self]:
-        return {cls.INITIAL_REVIEW, cls.ONGOING_REVIEW}  # pyright: ignore
+        return {cls.REVIEW, cls.SNOOZED}  # pyright: ignore
 
-    @classmethod
-    def payment_ready_statuses(cls) -> set[Self]:
-        return {cls.ACTIVE, *cls.review_statuses()}  # pyright: ignore
 
-    @classmethod
-    def payout_ready_statuses(cls) -> set[Self]:
-        return {cls.ACTIVE}  # pyright: ignore
+class OrganizationCapabilities(TypedDict):
+    checkout_payments: bool
+    subscription_renewals: bool
+    payouts: bool
+    refunds: bool
+    api_access: bool
+    dashboard_access: bool
+
+
+CapabilityName = Literal[
+    "checkout_payments",
+    "subscription_renewals",
+    "payouts",
+    "refunds",
+    "api_access",
+    "dashboard_access",
+]
+
+
+class InvalidStatusTransitionError(PolarError):
+    def __init__(
+        self, current: "OrganizationStatus", target: "OrganizationStatus"
+    ) -> None:
+        self.current = current
+        self.target = target
+        super().__init__(
+            f"Cannot transition organization status from "
+            f"{current.get_display_name()} to {target.get_display_name()}.",
+            400,
+        )
+
+
+STATUS_CAPABILITIES: dict[OrganizationStatus, OrganizationCapabilities] = {
+    OrganizationStatus.CREATED: {
+        "checkout_payments": False,
+        "subscription_renewals": False,
+        "payouts": False,
+        "refunds": False,
+        "api_access": True,
+        "dashboard_access": True,
+    },
+    OrganizationStatus.REVIEW: {
+        "checkout_payments": True,
+        "subscription_renewals": True,
+        "payouts": False,
+        "refunds": True,
+        "api_access": True,
+        "dashboard_access": True,
+    },
+    OrganizationStatus.SNOOZED: {
+        "checkout_payments": True,
+        "subscription_renewals": True,
+        "payouts": False,
+        "refunds": True,
+        "api_access": True,
+        "dashboard_access": True,
+    },
+    OrganizationStatus.ACTIVE: {
+        "checkout_payments": True,
+        "subscription_renewals": True,
+        "payouts": True,
+        "refunds": True,
+        "api_access": True,
+        "dashboard_access": True,
+    },
+    OrganizationStatus.DENIED: {
+        "checkout_payments": False,
+        "subscription_renewals": False,
+        "payouts": False,
+        "refunds": False,
+        "api_access": True,
+        "dashboard_access": True,
+    },
+    OrganizationStatus.OFFBOARDING: {
+        "checkout_payments": True,
+        "subscription_renewals": True,
+        "payouts": False,
+        "refunds": True,
+        "api_access": True,
+        "dashboard_access": True,
+    },
+    OrganizationStatus.BLOCKED: {
+        "checkout_payments": False,
+        "subscription_renewals": False,
+        "payouts": False,
+        "refunds": False,
+        "api_access": False,
+        "dashboard_access": False,
+    },
+}
+
+
+CAPABILITY_METADATA: dict[CapabilityName, tuple[str, str]] = {
+    "checkout_payments": (
+        "Checkout payments",
+        "Allow new checkouts and subscriptions.",
+    ),
+    "subscription_renewals": (
+        "Subscription renewals",
+        "Allow recurring billing cycles and dunning retries.",
+    ),
+    "payouts": (
+        "Payouts",
+        "Allow funds to be paid out to the payout account.",
+    ),
+    "refunds": (
+        "Refunds",
+        "Allow refunds to be issued on this organization's orders.",
+    ),
+    "api_access": (
+        "API access",
+        "Allow authenticated API access for team members.",
+    ),
+    "dashboard_access": (
+        "Dashboard access",
+        "Allow team members to sign in and access the dashboard.",
+    ),
+}
+
+CAPABILITY_NAMES: frozenset[str] = frozenset(CAPABILITY_METADATA.keys())
+
+
+# DENIED → ACTIVE and BLOCKED → ACTIVE additionally require a reason,
+# enforced at the service layer.
+ALLOWED_STATUS_TRANSITIONS: dict[OrganizationStatus, frozenset[OrganizationStatus]] = {
+    OrganizationStatus.CREATED: frozenset(
+        {
+            OrganizationStatus.REVIEW,
+            OrganizationStatus.ACTIVE,
+            OrganizationStatus.DENIED,
+            OrganizationStatus.BLOCKED,
+        }
+    ),
+    OrganizationStatus.REVIEW: frozenset(
+        {
+            OrganizationStatus.ACTIVE,
+            OrganizationStatus.SNOOZED,
+            OrganizationStatus.DENIED,
+            OrganizationStatus.OFFBOARDING,
+            OrganizationStatus.BLOCKED,
+        }
+    ),
+    OrganizationStatus.SNOOZED: frozenset(
+        {
+            OrganizationStatus.REVIEW,
+            OrganizationStatus.ACTIVE,
+            OrganizationStatus.DENIED,
+            OrganizationStatus.BLOCKED,
+        }
+    ),
+    OrganizationStatus.ACTIVE: frozenset(
+        {
+            OrganizationStatus.REVIEW,
+            OrganizationStatus.DENIED,
+            OrganizationStatus.BLOCKED,
+        }
+    ),
+    OrganizationStatus.DENIED: frozenset(
+        {
+            OrganizationStatus.ACTIVE,
+            OrganizationStatus.BLOCKED,
+        }
+    ),
+    OrganizationStatus.OFFBOARDING: frozenset(
+        {
+            OrganizationStatus.BLOCKED,
+        }
+    ),
+    OrganizationStatus.BLOCKED: frozenset(
+        {
+            OrganizationStatus.ACTIVE,
+        }
+    ),
+}
 
 
 class Organization(RateLimitGroupMixin, RecordModel):
@@ -280,18 +467,25 @@ class Organization(RateLimitGroupMixin, RecordModel):
         TIMESTAMP(timezone=True), nullable=True
     )
 
+    snooze_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+
     total_balance: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True, server_default="0"
     )
 
     internal_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    account_id: Mapped[UUID | None] = mapped_column(
-        Uuid, ForeignKey("accounts.id", ondelete="set null"), nullable=True
+    account_id: Mapped[UUID] = mapped_column(
+        Uuid,
+        ForeignKey("accounts.id", ondelete="restrict"),
+        nullable=False,
+        unique=True,
     )
 
     @declared_attr
-    def account(cls) -> Mapped[Account | None]:
+    def account(cls) -> Mapped[Account]:
         return relationship(Account, lazy="raise", back_populates="organizations")
 
     payout_account_id: Mapped[UUID | None] = mapped_column(
@@ -311,17 +505,19 @@ class Organization(RateLimitGroupMixin, RecordModel):
         TIMESTAMP(timezone=True), nullable=True, default=None
     )
 
-    # Time of blocking traffic/activity to given organization
-    blocked_at: Mapped[datetime | None] = mapped_column(
-        TIMESTAMP(timezone=True),
-        nullable=True,
-        default=None,
-    )
-
-    # Flag to block refunds for all orders in this organization
+    # DEPRECATED: use `capabilities["refunds"]` instead.
+    # `deferred=True` so default SELECTs don't include it, allowing the
+    # column to be dropped in a follow-up migration without a CD race.
     refunds_blocked: Mapped[bool] = mapped_column(
         nullable=False,
         default=False,
+        deferred=True,
+    )
+
+    capabilities: Mapped[OrganizationCapabilities | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        default=lambda: {**STATUS_CAPABILITIES[OrganizationStatus.CREATED]},
     )
 
     country: Mapped[str | None] = mapped_column(String(2), nullable=True, default=None)
@@ -370,6 +566,10 @@ class Organization(RateLimitGroupMixin, RecordModel):
         JSONB, nullable=False, default=dict
     )
 
+    @property
+    def is_member_model_enabled(self) -> bool:
+        return self.feature_settings.get("member_model_enabled", False)
+
     #
     # Currency and tax settings
     #
@@ -399,14 +599,83 @@ class Organization(RateLimitGroupMixin, RecordModel):
     # End: Fields synced from GitHub
     #
 
+    def get_effective_capabilities(self) -> OrganizationCapabilities:
+        """Return capabilities, falling back to the status defaults for rows
+        that pre-date the backfill."""
+        return self.capabilities or STATUS_CAPABILITIES[self.status]
+
+    def _capability(self, name: CapabilityName) -> bool:
+        return self.get_effective_capabilities()[name]
+
     @hybrid_property
     def can_authenticate(self) -> bool:
-        return not self.is_deleted and self.blocked_at is None
+        return not self.is_deleted and self._capability("api_access")
 
     @can_authenticate.inplace.expression
     @classmethod
     def _can_authenticate_expression(cls) -> ColumnElement[bool]:
-        return and_(cls.is_deleted.is_(False), cls.blocked_at.is_(None))
+        return and_(
+            cls.is_deleted.is_(False),
+            cls.capabilities["api_access"].as_boolean().is_(True),
+        )
+
+    @hybrid_property
+    def can_access_dashboard(self) -> bool:
+        return not self.is_deleted and self._capability("dashboard_access")
+
+    @can_access_dashboard.inplace.expression
+    @classmethod
+    def _can_access_dashboard_expression(cls) -> ColumnElement[bool]:
+        return and_(
+            cls.is_deleted.is_(False),
+            cls.capabilities["dashboard_access"].as_boolean().is_(True),
+        )
+
+    @hybrid_property
+    def can_accept_payments(self) -> bool:
+        return self._capability("checkout_payments")
+
+    @can_accept_payments.inplace.expression
+    @classmethod
+    def _can_accept_payments_expression(cls) -> ColumnElement[bool]:
+        return cls.capabilities["checkout_payments"].as_boolean().is_(True)
+
+    @hybrid_property
+    def can_renew_subscriptions(self) -> bool:
+        return self._capability("subscription_renewals")
+
+    @can_renew_subscriptions.inplace.expression
+    @classmethod
+    def _can_renew_subscriptions_expression(cls) -> ColumnElement[bool]:
+        return cls.capabilities["subscription_renewals"].as_boolean().is_(True)
+
+    @hybrid_property
+    def can_payout(self) -> bool:
+        return self._capability("payouts")
+
+    @can_payout.inplace.expression
+    @classmethod
+    def _can_payout_expression(cls) -> ColumnElement[bool]:
+        return cls.capabilities["payouts"].as_boolean().is_(True)
+
+    @hybrid_property
+    def can_refund(self) -> bool:
+        return self._capability("refunds")
+
+    @can_refund.inplace.expression
+    @classmethod
+    def _can_refund_expression(cls) -> ColumnElement[bool]:
+        return cls.capabilities["refunds"].as_boolean().is_(True)
+
+    def set_status(self, status: OrganizationStatus) -> None:
+        if (
+            status != self.status
+            and status not in ALLOWED_STATUS_TRANSITIONS[self.status]
+        ):
+            raise InvalidStatusTransitionError(self.status, status)
+        self.status = status
+        self.status_updated_at = datetime.now(UTC)
+        self.capabilities = {**STATUS_CAPABILITIES[status]}
 
     @hybrid_property
     def is_under_review(self) -> bool:
@@ -510,9 +779,7 @@ class Organization(RateLimitGroupMixin, RecordModel):
         )
 
     def is_blocked(self) -> bool:
-        if self.blocked_at is not None:
-            return True
-        return False
+        return self.status == OrganizationStatus.BLOCKED
 
     def is_active(self) -> bool:
         return self.status == OrganizationStatus.ACTIVE

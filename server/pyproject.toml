@@ -11,16 +11,16 @@ dependencies = [
   "sqlalchemy[asyncio]>=2.0.34",
   "greenlet>=3.1.1",
   "structlog>=24.4.0",
-  "githubkit==0.15.1",
+  "githubkit==0.15.3",
   "redis>=5.0.4",
   "sse-starlette>=2.0.0",
   "stripe>=14,<15",
   "pyjwt>=2.6.0",
-  "pydantic>=2.11",
+  "pydantic>=2.13.0",
   "sentry-sdk[fastapi,sqlalchemy]>=2.52.0",
   "posthog>=3.6.0",
   "python-slugify>=8.0.1",
-  "python-multipart>=0.0.12",
+  "python-multipart>=0.0.26",
   "safe-redirect-url>=0.1.1",
   "httpx-oauth>=0.16.0",
   "httpx>=0.23.0",
@@ -29,10 +29,10 @@ dependencies = [
   "python-dateutil>=2.9.0.post0",
   "pydantic-extra-types>=2.9.0",
   "sqlalchemy-utils>=0.41.1",
-  "authlib>=1.6.0",
+  "authlib>=1.6.10",
   "standardwebhooks>=1.0.0",
   "typer>=0.12.5",
-  "logfire[fastapi,httpx,sqlalchemy,redis]>=2.6.0",
+  "logfire[fastapi,httpx,sqlalchemy,redis]>=4.32.0",
   "makefun>=1.15.6",
   "boto3>=1.38.30",
   "itsdangerous>=2.2.0",
@@ -51,6 +51,8 @@ dependencies = [
   "prometheus-client>=0.21.0",
   "python-snappy>=0.7.3",
   "fpdf2>=2.8.3",
+  "arabic-reshaper>=3.0.0",
+  "python-bidi>=0.6.0",
   "pydantic-ai-slim[openai]>=1.16.0",
   "asgi-ratelimit>=0.10.0",
   "aiocsv>=1.4.0",
@@ -58,8 +60,8 @@ dependencies = [
   "clickhouse-connect>=0.8.0",
   "playwright>=1.50.0",
   "trafilatura>=2.0.0",
-  "polar-sdk==0.30.1",
-  "anyio>=4.12.1",
+  "polar-sdk==0.31.3",
+  "anyio>=4.13.0",
 ]
 
 [dependency-groups]
@@ -70,7 +72,7 @@ dev = [
   "typer>=0.12.5",
   "coverage>=7.6.0",
   "pytest-mock>=3.10.0",
-  "ruff>=0.6.9",
+  "ruff>=0.15.9",
   "pytest-asyncio>=0.24",
   "types-redis>=4.6.0.20240903",
   "pytest-subtests>=0.13.1",
@@ -78,11 +80,11 @@ dev = [
   "respx>=0.21.1",
   "pytest-cov>=5.0.0",
   "types-python-slugify>=8.0.0.3",
-  "types-requests>=2.31.0.10",
+  "types-requests>=2.33.0.20260408",
   "boto3-stubs[s3]>=1.38.30",
   "freezegun>=1.5.1",
   "fakeredis[lua]>=2.26.1",
-  "pytest-xdist[psutil]>=3.6.1",
+  "pytest-xdist[psutil]>=3.8.0",
   "sqlalchemy-utils>=0.41.2",
   "minio>=7.2.9",
   "locust>=2.20.0",
@@ -97,14 +99,15 @@ dev = [
 
 [tool.taskipy.tasks]
 emails = { cmd = "cd emails && pnpm i --frozen-lockfile && pnpm run build", help = "build emails" }
-backoffice = { cmd = "pnpm -C polar/backoffice install && pnpm -C polar/backoffice build", help = "build backoffice CSS and JS" }
+backoffice = { cmd = "pnpm -C polar/backoffice install --frozen-lockfile && pnpm -C polar/backoffice build", help = "build backoffice CSS and JS" }
 api = { cmd = "env AUTHLIB_INSECURE_TRANSPORT=true uvicorn polar.app:app --reload --workers 1 --host 127.0.0.1 --port 8000", help = "run api service" }
 worker = { cmd = "dramatiq -p 1 -t 1 --watch polar -f polar.worker.scheduler:start polar.worker.run", help = "run worker" }
 test = { cmd = "POLAR_ENV=testing python -m pytest --cov polar/ --cov-report=term-missing", help = "run all tests" }
 test_fast = { cmd = "POLAR_ENV=testing python -m pytest -n auto -p no:sugar --no-cov", help = "run all tests, but fast" }
 loadtest = { cmd = "locust -f load_tests/locustfile.py --host=http://127.0.0.1:8000", help = "run load tests (interactive)" }
-lint = { cmd = "ruff format . && ruff check --fix .", help = "run linters with autofix" }
-lint_check = { cmd = "ruff format --check . && ruff check .", help = "run ruff linter" }
+lint = { cmd = "ruff format . && ruff check --fix . && task lint_subquery", help = "run linters with autofix" }
+lint_check = { cmd = "ruff format --check . && ruff check . && task lint_subquery", help = "run ruff linter" }
+lint_subquery = { cmd = "python scripts/lint_subquery.py", help = "flag .subquery() calls that don't narrow columns" }
 lint_types = { cmd = "mypy polar scripts tests", help = "run mypy type verify" }
 db_migrate = { cmd = "python -m scripts.db upgrade", help = "run alembic upgrade" }
 db_recreate = { cmd = "python -m scripts.db recreate", help = "drop and recreate database" }
@@ -172,3 +175,4 @@ exclude-newer = "1 week"
 
 [tool.uv.sources]
 dramatiq = { git = "https://github.com/frankie567/dramatiq", rev = "memory-leak-asyncio-ter" }
+polar-sdk = { url = "https://files.pythonhosted.org/packages/ef/23/bd856ec12a8faef40bfb6b30e7add657952c7266f5f0ac7c156067fa30ea/polar_sdk-0.31.3-py3-none-any.whl" }

@@ -12,6 +12,7 @@ from .checkout_link_product import CheckoutLinkProduct
 from .checkout_product import CheckoutProduct
 from .custom_field import CustomField
 from .customer import Customer
+from .customer_email_verification import CustomerEmailVerification
 from .customer_meter import CustomerMeter
 from .customer_seat import CustomerSeat, SeatStatus
 from .customer_session import CustomerSession
@@ -27,7 +28,6 @@ from .event import Event
 from .event_type import EventType
 from .external_event import ExternalEvent
 from .file import File
-from .held_balance import HeldBalance
 from .issue_reward import IssueReward
 from .license_key import LicenseKey
 from .license_key_activation import LicenseKeyActivation
@@ -104,6 +104,7 @@ __all__ = [
     "CheckoutProduct",
     "CustomField",
     "Customer",
+    "CustomerEmailVerification",
     "CustomerMeter",
     "CustomerSeat",
     "CustomerSession",
@@ -119,7 +120,6 @@ __all__ = [
     "EventType",
     "ExternalEvent",
     "File",
-    "HeldBalance",
     "IssueReward",
     "LegacyRecurringProductPriceCustom",
     "LegacyRecurringProductPriceFixed",

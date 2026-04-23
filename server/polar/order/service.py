@@ -42,7 +42,6 @@ from polar.event.system import (
 from polar.eventstream.service import publish as eventstream_publish
 from polar.exceptions import PolarError, PolarRequestValidationError, ValidationError
 from polar.file.s3 import S3_SERVICES
-from polar.held_balance.service import held_balance as held_balance_service
 from polar.integrations.stripe.service import (
     STRIPE_METADATA_PAYMENT_TRIGGER,
 )
@@ -70,9 +69,7 @@ from polar.models import (
     User,
     WalletTransaction,
 )
-from polar.models.held_balance import HeldBalance
 from polar.models.order import OrderBillingReasonInternal, OrderStatus
-from polar.models.organization import OrganizationStatus
 from polar.models.payment import PaymentTrigger
 from polar.models.product import ProductBillingType
 from polar.models.subscription import SubscriptionStatus
@@ -95,6 +92,7 @@ from polar.product.guard import (
     is_static_price,
 )
 from polar.product.price_set import PriceSet
+from polar.product.repository import ProductRepository
 from polar.subscription.service import subscription as subscription_service
 from polar.tax.calculation import (
     CalculationExpiredError,
@@ -334,7 +332,14 @@ class OrderService:
             statement = statement.where(Order.product_id.in_(product_id))
 
         if product_billing_type is not None:
-            statement = statement.where(Product.billing_type.in_(product_billing_type))
+            product_repository = ProductRepository.from_session(session)
+            matching_product_ids = await product_repository.get_ids_by_billing_type(
+                product_billing_type,
+                organization_ids=organization_id,
+            )
+            if not matching_product_ids:
+                return [], 0
+            statement = statement.where(Order.product_id.in_(matching_product_ids))
 
         if discount_id is not None:
             statement = statement.where(Order.discount_id.in_(discount_id))
@@ -1014,15 +1019,24 @@ class OrderService:
             raise OrderNotPending(order)
 
         organization = order.organization
-        if (
-            organization.is_blocked()
-            or organization.status == OrganizationStatus.DENIED
-        ):
+        is_renewal_payment = (
+            payment_trigger is not None and payment_trigger.is_renewal_payment()
+        )
+        capability_enabled = (
+            organization.can_renew_subscriptions
+            if is_renewal_payment
+            else organization.can_accept_payments
+        )
+        if not capability_enabled:
             log.info(
-                "Organization is blocked or denied, skipping payment",
+                "Organization capability disabled, skipping payment",
                 order_id=order.id,
                 organization_id=organization.id,
-                organization_status=organization.status,
+                capability=(
+                    "subscription_renewals"
+                    if is_renewal_payment
+                    else "checkout_payments"
+                ),
             )
             return
 
@@ -1676,9 +1690,15 @@ class OrderService:
                 )
                 for key, value in url_params.items()
             }
-            query_string = urlencode(params)
-            url_path = url_path_template.format(organization=organization.slug)
-            url = settings.generate_frontend_url(f"{url_path}?{query_string}")
+            override_url = settings.CUSTOMER_PORTAL_URL_OVERRIDES.get(
+                str(organization.id)
+            )
+            if override_url is not None:
+                url = f"{override_url}?{urlencode({'email': recipient_email})}"
+            else:
+                query_string = urlencode(params)
+                url_path = url_path_template.format(organization=organization.slug)
+                url = settings.generate_frontend_url(f"{url_path}?{query_string}")
             email = EmailAdapter.validate_python(
                 {
                     "template": template_name,
@@ -1760,6 +1780,9 @@ class OrderService:
         organization = order.organization
         account_repository = AccountRepository.from_session(session)
         account = await account_repository.get_by_organization(organization.id)
+        assert account is not None, (
+            "Organization must have an account to create balance"
+        )
 
         # Retrieve the payment transaction and link it to the order
         payment_transaction = await balance_transaction_service.get_by(
@@ -1775,29 +1798,6 @@ class OrderService:
         payment_transaction.order = order
         payment_transaction.payment_customer = order.customer
         session.add(payment_transaction)
-
-        # Prepare an held balance
-        # It'll be used if the account is not created yet
-        held_balance = HeldBalance(
-            amount=transfer_amount, order=order, payment_transaction=payment_transaction
-        )
-
-        # No account, create the held balance
-        if account is None:
-            held_balance.organization = organization
-
-            # Sanity check: make sure we didn't already create a held balance for this order
-            existing_held_balance = await held_balance_service.get_by(
-                session,
-                payment_transaction_id=payment_transaction.id,
-                organization_id=organization.id,
-            )
-            if existing_held_balance is not None:
-                raise AlreadyBalancedOrder(order, payment_transaction)
-
-            await held_balance_service.create(session, held_balance=held_balance)
-
-            return
 
         # Sanity check: make sure we didn't already create a balance for this order
         existing_balance_transaction = await balance_transaction_service.get_by(
@@ -2330,6 +2330,16 @@ class OrderService:
 
     async def process_dunning_order(self, session: AsyncSession, order: Order) -> Order:
         """Process a single order due for dunning payment retry."""
+        # Defensive: capability may have flipped off after the cron picked
+        # this order up. The repository filter normally prevents this.
+        if not order.organization.can_renew_subscriptions:
+            log.info(
+                "Subscription renewals disabled, skipping dunning",
+                order_id=order.id,
+                organization_id=order.organization.id,
+            )
+            return order
+
         if order.subscription is None:
             log.warning(
                 "Order has no subscription, skipping dunning",

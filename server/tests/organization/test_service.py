@@ -1,30 +1,36 @@
-from datetime import UTC, datetime
-from unittest.mock import call
+import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
 from pytest_mock import MockerFixture
 
 from polar.auth.models import AuthSubject
-from polar.config import Environment, settings
+from polar.config import settings
 from polar.enums import (
     InvoiceNumbering,
     PayoutAccountType,
+    SubscriptionProrationBehavior,
     SubscriptionRecurringInterval,
 )
 from polar.exceptions import PolarRequestValidationError
-from polar.models import Customer, Organization, Product, User
+from polar.models import Customer, Organization, Product, User, UserOrganization
 from polar.models.account import Account
 from polar.models.organization import (
+    STATUS_CAPABILITIES,
+    InvalidStatusTransitionError,
     OrganizationNotificationSettings,
     OrganizationStatus,
+    OrganizationSubscriptionSettings,
 )
 from polar.models.organization_review import OrganizationReview
+from polar.models.user import IdentityVerificationStatus
 from polar.organization.schemas import (
     OrganizationCreate,
     OrganizationFeatureSettings,
     OrganizationUpdate,
 )
+from polar.organization.service import OrganizationError
 from polar.organization.service import organization as organization_service
 from polar.organization_review.schemas import ReviewVerdict
 from polar.postgres import AsyncSession
@@ -33,7 +39,6 @@ from polar.user_organization.service import (
 )
 from tests.fixtures.database import SaveFixture
 from tests.fixtures.random_objects import (
-    create_account,
     create_order,
     create_payout_account,
 )
@@ -111,21 +116,18 @@ class TestCreate:
         )
 
     @pytest.mark.auth
-    async def test_enqueues_polar_self_customer_before_initial_member(
+    async def test_enqueues_polar_self_customer_with_owner(
         self,
         mocker: MockerFixture,
         auth_subject: AuthSubject[User],
         session: AsyncSession,
     ) -> None:
-        polar_self_manager = mocker.MagicMock()
         create_customer_mock = mocker.patch(
             "polar.organization.service.polar_self_service.enqueue_create_customer"
         )
-        polar_self_manager.attach_mock(create_customer_mock, "enqueue_create_customer")
         add_member_mock = mocker.patch(
             "polar.organization.service.polar_self_service.enqueue_add_member"
         )
-        polar_self_manager.attach_mock(add_member_mock, "enqueue_add_member")
 
         organization = await organization_service.create(
             session,
@@ -135,30 +137,12 @@ class TestCreate:
 
         create_customer_mock.assert_called_once_with(
             organization_id=organization.id,
-            email=organization.email or auth_subject.subject.email,
             name=organization.name,
+            owner_external_id=str(auth_subject.subject.id),
+            owner_email=auth_subject.subject.email,
+            owner_name=auth_subject.subject.public_name,
         )
-        add_member_mock.assert_called_once_with(
-            external_customer_id=str(organization.id),
-            email=auth_subject.subject.email,
-            name=auth_subject.subject.public_name,
-            external_id=str(auth_subject.subject.id),
-            delay=1000,
-        )
-        assert polar_self_manager.mock_calls == [
-            call.enqueue_create_customer(
-                organization_id=organization.id,
-                email=organization.email or auth_subject.subject.email,
-                name=organization.name,
-            ),
-            call.enqueue_add_member(
-                external_customer_id=str(organization.id),
-                email=auth_subject.subject.email,
-                name=auth_subject.subject.public_name,
-                external_id=str(auth_subject.subject.id),
-                delay=1000,
-            ),
-        ]
+        add_member_mock.assert_not_called()
 
     @pytest.mark.auth
     async def test_valid_with_feature_settings(
@@ -366,7 +350,7 @@ class TestCheckReviewThreshold:
         organization: Organization,
     ) -> None:
         # Given organization already under review
-        organization.status = OrganizationStatus.INITIAL_REVIEW
+        organization.status = OrganizationStatus.REVIEW
         organization.next_review_threshold = 1000
         organization.total_balance = None
 
@@ -381,7 +365,7 @@ class TestCheckReviewThreshold:
         )
 
         # Then - status unchanged but total_balance is updated
-        assert result.status == OrganizationStatus.INITIAL_REVIEW
+        assert result.status == OrganizationStatus.REVIEW
         assert result.total_balance == 7500
 
     async def test_below_review_threshold(
@@ -431,7 +415,7 @@ class TestCheckReviewThreshold:
         )
 
         # Then
-        assert result.status == OrganizationStatus.INITIAL_REVIEW
+        assert result.status == OrganizationStatus.REVIEW
         assert result.total_balance == 5000
         transaction_sum_mock.assert_called_once()
 
@@ -458,7 +442,7 @@ class TestCheckReviewThreshold:
         )
 
         # Then
-        assert result.status == OrganizationStatus.ONGOING_REVIEW
+        assert result.status == OrganizationStatus.REVIEW
         assert result.total_balance == 5000
         transaction_sum_mock.assert_called_once()
         enqueue_job_mock.assert_called_once_with(
@@ -490,6 +474,80 @@ class TestCheckReviewThreshold:
         assert result.status == OrganizationStatus.ACTIVE
         assert result.total_balance == 0
 
+    async def test_snoozed_within_grace_period_stays_snoozed(
+        self,
+        mocker: MockerFixture,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        # Given: snoozed less than 24h ago
+        organization.status = OrganizationStatus.SNOOZED
+        organization.status_updated_at = datetime.now(UTC) - timedelta(hours=12)
+        organization.next_review_threshold = 1000
+
+        mocker.patch(
+            "polar.organization.service.transaction_service.get_transactions_sum",
+            return_value=5000,
+        )
+
+        result = await organization_service.check_review_threshold(
+            session, organization
+        )
+
+        # Then: stays snoozed, no review triggered
+        assert result.status == OrganizationStatus.SNOOZED
+
+    async def test_snoozed_after_grace_period_returns_to_review(
+        self,
+        mocker: MockerFixture,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        # Given: snoozed more than 24h ago (grace period expired)
+        organization.status = OrganizationStatus.SNOOZED
+        organization.status_updated_at = datetime.now(UTC) - timedelta(hours=25)
+        organization.next_review_threshold = 1000
+
+        mocker.patch(
+            "polar.organization.service.transaction_service.get_transactions_sum",
+            return_value=5000,
+        )
+        enqueue_job_mock = mocker.patch("polar.organization.service.enqueue_job")
+
+        result = await organization_service.check_review_threshold(
+            session, organization
+        )
+
+        # Then: transitions back to REVIEW and enqueues review job
+        assert result.status == OrganizationStatus.REVIEW
+        assert result.status_updated_at is not None
+        enqueue_job_mock.assert_called_once_with(
+            "organization.under_review", organization_id=organization.id
+        )
+
+    async def test_snoozed_without_status_updated_at_stays_snoozed(
+        self,
+        mocker: MockerFixture,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        # Given: snoozed but status_updated_at is None (edge case)
+        organization.status = OrganizationStatus.SNOOZED
+        organization.status_updated_at = None
+        organization.next_review_threshold = 1000
+
+        mocker.patch(
+            "polar.organization.service.transaction_service.get_transactions_sum",
+            return_value=5000,
+        )
+
+        result = await organization_service.check_review_threshold(
+            session, organization
+        )
+
+        # Then: stays snoozed (can't compute grace period)
+        assert result.status == OrganizationStatus.SNOOZED
+
 
 @pytest.mark.asyncio
 class TestConfirmOrganizationReviewed:
@@ -500,7 +558,7 @@ class TestConfirmOrganizationReviewed:
         organization: Organization,
     ) -> None:
         # Given organization under review
-        organization.status = OrganizationStatus.INITIAL_REVIEW
+        organization.status = OrganizationStatus.REVIEW
 
         enqueue_job_mock = mocker.patch("polar.organization.service.enqueue_job")
 
@@ -517,6 +575,34 @@ class TestConfirmOrganizationReviewed:
             "organization.reviewed",
             organization_id=organization.id,
             initial_review=True,
+            silent=False,
+        )
+
+    async def test_initial_review_silent(
+        self,
+        mocker: MockerFixture,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        # Given organization under review
+        organization.status = OrganizationStatus.REVIEW
+
+        enqueue_job_mock = mocker.patch("polar.organization.service.enqueue_job")
+
+        # When
+        result = await organization_service.confirm_organization_reviewed(
+            session, organization, 15000, silent=True
+        )
+
+        # Then
+        assert result.status == OrganizationStatus.ACTIVE
+        assert result.initially_reviewed_at is not None
+        assert result.next_review_threshold == 15000
+        enqueue_job_mock.assert_called_once_with(
+            "organization.reviewed",
+            organization_id=organization.id,
+            initial_review=True,
+            silent=True,
         )
 
     async def test_ongoing_review(
@@ -526,7 +612,7 @@ class TestConfirmOrganizationReviewed:
         organization: Organization,
     ) -> None:
         # Given organization under review
-        organization.status = OrganizationStatus.ONGOING_REVIEW
+        organization.status = OrganizationStatus.REVIEW
         initially_reviewed_at = datetime(2025, 1, 1, 12, 0, tzinfo=UTC)
         organization.initially_reviewed_at = initially_reviewed_at
 
@@ -545,6 +631,7 @@ class TestConfirmOrganizationReviewed:
             "organization.reviewed",
             organization_id=organization.id,
             initial_review=False,
+            silent=False,
         )
 
     async def test_overrides_rejected_appeal(
@@ -574,9 +661,9 @@ class TestConfirmOrganizationReviewed:
 
         mocker.patch("polar.organization.service.enqueue_job")
 
-        # When: operator manually approves the org
+        # When: operator manually approves the org with a reason
         result = await organization_service.confirm_organization_reviewed(
-            session, organization, 15000
+            session, organization, 15000, reason="Appeal re-examined"
         )
 
         # Then: appeal decision is overridden to approved
@@ -593,15 +680,12 @@ class TestHandleOngoingReviewVerdict:
         session: AsyncSession,
         organization: Organization,
     ) -> None:
-        # Given: org is ONGOING_REVIEW with threshold=$500 (50_000 cents)
-        organization.status = OrganizationStatus.ONGOING_REVIEW
+        # Given: org is REVIEW with threshold=$500 (50_000 cents)
+        organization.status = OrganizationStatus.REVIEW
         organization.next_review_threshold = 50_000
         organization.initially_reviewed_at = datetime(2025, 1, 1, 12, 0, tzinfo=UTC)
 
         enqueue_job_mock = mocker.patch("polar.organization.service.enqueue_job")
-        plain_mock = mocker.patch(
-            "polar.organization.service.plain_service.create_organization_review_thread"
-        )
 
         # When: verdict is APPROVE
         result = await organization_service.handle_ongoing_review_verdict(
@@ -613,7 +697,6 @@ class TestHandleOngoingReviewVerdict:
         assert organization.status == OrganizationStatus.ACTIVE
         assert organization.next_review_threshold == 100_000
         enqueue_job_mock.assert_called_once()
-        plain_mock.assert_not_called()
 
     async def test_escalate_on_deny_verdict(
         self,
@@ -621,52 +704,21 @@ class TestHandleOngoingReviewVerdict:
         session: AsyncSession,
         organization: Organization,
     ) -> None:
-        # Given: org is ONGOING_REVIEW with threshold=$500
-        organization.status = OrganizationStatus.ONGOING_REVIEW
+        # Given: org is REVIEW with threshold=$500
+        organization.status = OrganizationStatus.REVIEW
         organization.next_review_threshold = 50_000
         organization.initially_reviewed_at = datetime(2025, 1, 1, 12, 0, tzinfo=UTC)
 
         enqueue_job_mock = mocker.patch("polar.organization.service.enqueue_job")
-        plain_mock = mocker.patch(
-            "polar.organization.service.plain_service.create_organization_review_thread"
-        )
 
         # When: verdict is DENY
         result = await organization_service.handle_ongoing_review_verdict(
             session, organization, ReviewVerdict.DENY
         )
 
-        # Then: escalated, Plain ticket created, status unchanged
+        # Then: escalated to backoffice (status unchanged), no auto-approval side effects
         assert result is False
-        assert organization.status == OrganizationStatus.ONGOING_REVIEW
-        plain_mock.assert_called_once_with(session, organization)
-        enqueue_job_mock.assert_not_called()
-
-    async def test_escalate_on_needs_human_review(
-        self,
-        mocker: MockerFixture,
-        session: AsyncSession,
-        organization: Organization,
-    ) -> None:
-        # Given: org is ONGOING_REVIEW with threshold=$500
-        organization.status = OrganizationStatus.ONGOING_REVIEW
-        organization.next_review_threshold = 50_000
-        organization.initially_reviewed_at = datetime(2025, 1, 1, 12, 0, tzinfo=UTC)
-
-        enqueue_job_mock = mocker.patch("polar.organization.service.enqueue_job")
-        plain_mock = mocker.patch(
-            "polar.organization.service.plain_service.create_organization_review_thread"
-        )
-
-        # When: verdict is DENY
-        result = await organization_service.handle_ongoing_review_verdict(
-            session, organization, ReviewVerdict.DENY
-        )
-
-        # Then: escalated, Plain ticket created
-        assert result is False
-        assert organization.status == OrganizationStatus.ONGOING_REVIEW
-        plain_mock.assert_called_once_with(session, organization)
+        assert organization.status == OrganizationStatus.REVIEW
         enqueue_job_mock.assert_not_called()
 
     async def test_auto_approve_low_threshold(
@@ -675,15 +727,12 @@ class TestHandleOngoingReviewVerdict:
         session: AsyncSession,
         organization: Organization,
     ) -> None:
-        # Given: org is ONGOING_REVIEW with a low threshold (no min threshold required)
-        organization.status = OrganizationStatus.ONGOING_REVIEW
+        # Given: org is REVIEW with a low threshold (no min threshold required)
+        organization.status = OrganizationStatus.REVIEW
         organization.next_review_threshold = 100
         organization.initially_reviewed_at = datetime(2025, 1, 1, 12, 0, tzinfo=UTC)
 
         enqueue_job_mock = mocker.patch("polar.organization.service.enqueue_job")
-        plain_mock = mocker.patch(
-            "polar.organization.service.plain_service.create_organization_review_thread"
-        )
 
         # When: verdict is APPROVE
         result = await organization_service.handle_ongoing_review_verdict(
@@ -695,7 +744,6 @@ class TestHandleOngoingReviewVerdict:
         assert organization.status == OrganizationStatus.ACTIVE
         assert organization.next_review_threshold == 10_000
         enqueue_job_mock.assert_called_once()
-        plain_mock.assert_not_called()
 
     async def test_auto_approve_zero_threshold(
         self,
@@ -703,15 +751,12 @@ class TestHandleOngoingReviewVerdict:
         session: AsyncSession,
         organization: Organization,
     ) -> None:
-        # Given: org is ONGOING_REVIEW with default threshold of $0
-        organization.status = OrganizationStatus.ONGOING_REVIEW
+        # Given: org is REVIEW with default threshold of $0
+        organization.status = OrganizationStatus.REVIEW
         organization.next_review_threshold = 0
         organization.initially_reviewed_at = datetime(2025, 1, 1, 12, 0, tzinfo=UTC)
 
         enqueue_job_mock = mocker.patch("polar.organization.service.enqueue_job")
-        plain_mock = mocker.patch(
-            "polar.organization.service.plain_service.create_organization_review_thread"
-        )
 
         # When: verdict is APPROVE
         result = await organization_service.handle_ongoing_review_verdict(
@@ -723,32 +768,27 @@ class TestHandleOngoingReviewVerdict:
         assert organization.status == OrganizationStatus.ACTIVE
         assert organization.next_review_threshold == 10_000
         enqueue_job_mock.assert_called_once()
-        plain_mock.assert_not_called()
 
-    async def test_not_eligible_initial_review(
+    async def test_not_eligible_no_initial_review(
         self,
         mocker: MockerFixture,
         session: AsyncSession,
         organization: Organization,
     ) -> None:
-        # Given: org is INITIAL_REVIEW with threshold=$500
-        organization.status = OrganizationStatus.INITIAL_REVIEW
+        # Given: org is REVIEW without initially_reviewed_at
+        organization.status = OrganizationStatus.REVIEW
         organization.next_review_threshold = 50_000
 
         enqueue_job_mock = mocker.patch("polar.organization.service.enqueue_job")
-        plain_mock = mocker.patch(
-            "polar.organization.service.plain_service.create_organization_review_thread"
-        )
 
-        # When: verdict is APPROVE but status is INITIAL_REVIEW
+        # When: verdict is APPROVE but org hasn't been initially reviewed
         result = await organization_service.handle_ongoing_review_verdict(
             session, organization, ReviewVerdict.APPROVE
         )
 
-        # Then: not eligible, escalated to Plain
+        # Then: not eligible for auto-approval, stays under review for backoffice handling
         assert result is False
-        assert organization.status == OrganizationStatus.INITIAL_REVIEW
-        plain_mock.assert_called_once_with(session, organization)
+        assert organization.status == OrganizationStatus.REVIEW
         enqueue_job_mock.assert_not_called()
 
     async def test_not_eligible_wrong_status(
@@ -763,18 +803,14 @@ class TestHandleOngoingReviewVerdict:
         organization.initially_reviewed_at = datetime(2025, 1, 1, 12, 0, tzinfo=UTC)
 
         enqueue_job_mock = mocker.patch("polar.organization.service.enqueue_job")
-        plain_mock = mocker.patch(
-            "polar.organization.service.plain_service.create_organization_review_thread"
-        )
 
-        # When: verdict is APPROVE but status is ACTIVE (not ONGOING_REVIEW)
+        # When: verdict is APPROVE but status is ACTIVE (not REVIEW)
         result = await organization_service.handle_ongoing_review_verdict(
             session, organization, ReviewVerdict.APPROVE
         )
 
-        # Then: not eligible, but org is not under review so no Plain thread
+        # Then: not eligible for auto-approval
         assert result is False
-        plain_mock.assert_not_called()
         enqueue_job_mock.assert_not_called()
 
 
@@ -814,61 +850,35 @@ class TestSetOrganizationUnderReview:
         )
 
         # Then
-        assert result.status == OrganizationStatus.ONGOING_REVIEW
+        assert result.status == OrganizationStatus.REVIEW
         enqueue_job_mock.assert_called_once_with(
             "organization.under_review", organization_id=organization.id
         )
 
 
-@pytest.mark.asyncio
 class TestGetPaymentStatus:
-    async def test_all_steps_complete_grandfathered(
+    def test_active_org_is_payment_ready(
         self,
-        session: AsyncSession,
-        save_fixture: SaveFixture,
         organization: Organization,
-        product: Product,
-        mocker: MockerFixture,
-        user: User,
     ) -> None:
-        # Grandfathered organization (created before cutoff)
-        organization.created_at = datetime(2025, 8, 4, 8, 0, tzinfo=UTC)
-        await save_fixture(organization)
-
-        # Mock the API key count
-        mocker.patch(
-            "polar.organization_access_token.repository.OrganizationAccessTokenRepository.count_by_organization_id",
-            return_value=1,  # Has 1 API key
-        )
-
-        payment_status = await organization_service.get_payment_status(
-            session, organization
-        )
-
-        # Should be payment ready because it's grandfathered
+        # Default fixture status is ACTIVE → checkout_payments capability is True.
+        payment_status = organization_service.get_payment_status(organization)
         assert payment_status.payment_ready is True
 
-    async def test_sandbox_environment_allows_payments(
+    def test_sandbox_environment_allows_payments(
         self,
-        session: AsyncSession,
-        save_fixture: SaveFixture,
         organization: Organization,
         mocker: MockerFixture,
     ) -> None:
-        # Make organization not payment ready (new org without account setup)
-        organization.created_at = datetime(2025, 8, 4, 12, 0, tzinfo=UTC)
-        organization.status = OrganizationStatus.CREATED
-        organization.account_id = None
-        await save_fixture(organization)
-
-        # Mock environment to be sandbox
-        mocker.patch("polar.organization.service.settings.ENV", Environment.sandbox)
-
-        payment_status = await organization_service.get_payment_status(
-            session, organization
+        # An org with the capability disabled is normally not payment-ready,
+        # but sandbox bypasses every gate.
+        organization.set_status(OrganizationStatus.BLOCKED)
+        mocker.patch(
+            "polar.organization.service.settings.is_sandbox", return_value=True
         )
 
-        # Should be payment ready in sandbox even if account setup is incomplete
+        payment_status = organization_service.get_payment_status(organization)
+
         assert payment_status.payment_ready is True
 
 
@@ -1039,13 +1049,23 @@ class TestSubmitAppeal:
 
 @pytest.mark.asyncio
 class TestApproveAppeal:
-    async def test_approve_appeal_success(
+    async def test_approve_appeal_activates_when_all_gates_pass(
         self,
         session: AsyncSession,
         save_fixture: SaveFixture,
         organization: Organization,
+        user: User,
     ) -> None:
-        organization.status = OrganizationStatus.INITIAL_REVIEW
+        organization.status = OrganizationStatus.DENIED
+        organization.details_submitted_at = datetime.now(UTC)
+        organization.details = {"about": "Test"}
+        await save_fixture(organization)
+
+        user.identity_verification_status = IdentityVerificationStatus.verified
+        await save_fixture(user)
+
+        await create_payout_account(save_fixture, organization, user)
+
         review = OrganizationReview(
             organization_id=organization.id,
             verdict=OrganizationReview.Verdict.FAIL,
@@ -1062,6 +1082,34 @@ class TestApproveAppeal:
         result = await organization_service.approve_appeal(session, organization)
 
         assert organization.status == OrganizationStatus.ACTIVE
+        assert result.appeal_decision == OrganizationReview.AppealDecision.APPROVED
+        assert result.appeal_reviewed_at is not None
+
+    async def test_approve_appeal_records_decision_but_stays_denied_when_gates_missing(
+        self,
+        session: AsyncSession,
+        save_fixture: SaveFixture,
+        organization: Organization,
+    ) -> None:
+        organization.status = OrganizationStatus.DENIED
+        await save_fixture(organization)
+
+        review = OrganizationReview(
+            organization_id=organization.id,
+            verdict=OrganizationReview.Verdict.FAIL,
+            risk_score=85.0,
+            violated_sections=["terms_of_service"],
+            reason="Policy violation detected",
+            model_used="test-model",
+            organization_details_snapshot={"name": organization.name},
+            appeal_submitted_at=datetime.now(UTC),
+            appeal_reason="We have fixed the issues",
+        )
+        await save_fixture(review)
+
+        result = await organization_service.approve_appeal(session, organization)
+
+        assert organization.status == OrganizationStatus.DENIED
         assert result.appeal_decision == OrganizationReview.AppealDecision.APPROVED
         assert result.appeal_reviewed_at is not None
 
@@ -1526,35 +1574,25 @@ class TestRequestDeletion:
         assert organization.deleted_at is None
         enqueue_job_mock.assert_called_once()
 
-    @pytest.mark.auth
-    async def test_non_admin_with_account_raises_not_permitted(
-        self,
-        session: AsyncSession,
-        save_fixture: SaveFixture,
-        auth_subject: AuthSubject[User],
-        organization: Organization,
-    ) -> None:
-        """Non-admin cannot delete organization with an account."""
-        from polar.exceptions import NotPermitted
-
-        # Create a different user who is the admin
-        other_user = User(email="admin@example.com")
-        await save_fixture(other_user)
-
-        account = await create_account(
-            save_fixture, organization=organization, user=other_user
-        )
-
-        with pytest.raises(NotPermitted) as exc_info:
-            await organization_service.request_deletion(
-                session, auth_subject, organization
-            )
-
-        assert "account admin" in str(exc_info.value).lower()
-
 
 @pytest.mark.asyncio
 class TestSoftDeleteOrganization:
+    async def test_enqueues_polar_self_customer_deletion(
+        self,
+        mocker: MockerFixture,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        enqueue_delete_customer_mock = mocker.patch(
+            "polar.organization.service.polar_self_service.enqueue_delete_customer"
+        )
+
+        await organization_service.soft_delete_organization(session, organization)
+
+        enqueue_delete_customer_mock.assert_called_once_with(
+            organization_id=organization.id
+        )
+
     async def test_anonymizes_pii_preserves_slug(
         self,
         session: AsyncSession,
@@ -1609,6 +1647,25 @@ class TestSoftDeleteOrganization:
 
         assert result.details == {}
         assert result.socials == []
+
+
+@pytest.mark.asyncio
+class TestDelete:
+    async def test_enqueues_polar_self_customer_deletion(
+        self,
+        mocker: MockerFixture,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        enqueue_delete_customer_mock = mocker.patch(
+            "polar.organization.service.polar_self_service.enqueue_delete_customer"
+        )
+
+        await organization_service.delete(session, organization)
+
+        enqueue_delete_customer_mock.assert_called_once_with(
+            organization_id=organization.id
+        )
 
 
 @pytest.mark.asyncio
@@ -1759,3 +1816,559 @@ class TestUpdateSeatBasedPricing:
         )
 
         assert result.feature_settings["seat_based_pricing_enabled"] is True
+
+
+@pytest.mark.asyncio
+class TestResetProrationBehavior:
+    async def test_cant_set_without_feature_flag(
+        self,
+        session: AsyncSession,
+        save_fixture: SaveFixture,
+        organization: Organization,
+    ) -> None:
+        organization.feature_settings = {
+            **organization.feature_settings,
+            "reset_proration_behavior_enabled": False,
+        }
+        await save_fixture(organization)
+
+        with pytest.raises(PolarRequestValidationError):
+            await organization_service.update(
+                session,
+                organization,
+                OrganizationUpdate(
+                    subscription_settings=OrganizationSubscriptionSettings(
+                        allow_multiple_subscriptions=False,
+                        proration_behavior=SubscriptionProrationBehavior.reset,
+                        benefit_revocation_grace_period=0,
+                        prevent_trial_abuse=False,
+                        allow_customer_updates=True,
+                    ),
+                ),
+            )
+
+    async def test_can_set_with_feature_flag(
+        self,
+        session: AsyncSession,
+        save_fixture: SaveFixture,
+        organization: Organization,
+    ) -> None:
+        organization.feature_settings = {
+            **organization.feature_settings,
+            "reset_proration_behavior_enabled": True,
+        }
+        await save_fixture(organization)
+
+        result = await organization_service.update(
+            session,
+            organization,
+            OrganizationUpdate(
+                subscription_settings=OrganizationSubscriptionSettings(
+                    allow_multiple_subscriptions=False,
+                    proration_behavior=SubscriptionProrationBehavior.reset,
+                    benefit_revocation_grace_period=0,
+                    prevent_trial_abuse=False,
+                    allow_customer_updates=True,
+                ),
+            ),
+        )
+
+        assert (
+            result.subscription_settings["proration_behavior"]
+            == SubscriptionProrationBehavior.reset
+        )
+
+
+@pytest.mark.asyncio
+class TestSetOrganizationOffboarding:
+    async def test_from_review(
+        self,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        organization.status = OrganizationStatus.REVIEW
+
+        result = await organization_service.set_organization_offboarding(
+            session, organization
+        )
+
+        assert result.status == OrganizationStatus.OFFBOARDING
+        assert result.status_updated_at is not None
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            OrganizationStatus.SNOOZED,
+            OrganizationStatus.ACTIVE,
+            OrganizationStatus.DENIED,
+            OrganizationStatus.CREATED,
+        ],
+    )
+    async def test_from_non_review_raises(
+        self,
+        status: OrganizationStatus,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        organization.status = status
+
+        with pytest.raises(Exception, match="Only organizations under review"):
+            await organization_service.set_organization_offboarding(
+                session, organization
+            )
+
+    async def test_with_reason_appends_internal_notes(
+        self,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        organization.status = OrganizationStatus.REVIEW
+        organization.internal_notes = None
+
+        result = await organization_service.set_organization_offboarding(
+            session, organization, reason="Requested by merchant"
+        )
+
+        assert result.status == OrganizationStatus.OFFBOARDING
+        assert result.internal_notes is not None
+        assert "Requested by merchant" in result.internal_notes
+
+
+@pytest.mark.asyncio
+class TestSnoozeOrganization:
+    async def test_from_review(
+        self,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        organization.status = OrganizationStatus.REVIEW
+        organization.snooze_count = 0
+
+        result = await organization_service.snooze_organization(session, organization)
+
+        assert result.status == OrganizationStatus.SNOOZED
+        assert result.snooze_count == 1
+        assert result.status_updated_at is not None
+
+    async def test_increments_snooze_count(
+        self,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        organization.status = OrganizationStatus.REVIEW
+        organization.snooze_count = 3
+
+        result = await organization_service.snooze_organization(session, organization)
+
+        assert result.snooze_count == 4
+
+    async def test_from_non_review_raises(
+        self,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        organization.status = OrganizationStatus.ACTIVE
+
+        with pytest.raises(Exception, match="Only organizations under review"):
+            await organization_service.snooze_organization(session, organization)
+
+    async def test_with_reason_appends_internal_notes(
+        self,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        organization.status = OrganizationStatus.REVIEW
+        organization.snooze_count = 0
+        organization.internal_notes = None
+
+        result = await organization_service.snooze_organization(
+            session, organization, reason="Merchant not responding"
+        )
+
+        assert result.internal_notes is not None
+        assert "Merchant not responding" in result.internal_notes
+        assert "snoozed (#1)" in result.internal_notes
+
+    async def test_appends_to_existing_notes(
+        self,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        organization.status = OrganizationStatus.REVIEW
+        organization.snooze_count = 0
+        organization.internal_notes = "Previous note"
+
+        result = await organization_service.snooze_organization(session, organization)
+
+        assert result.internal_notes is not None
+        assert "Previous note" in result.internal_notes
+        assert "snoozed (#1)" in result.internal_notes
+
+
+@pytest.mark.asyncio
+class TestUnsnoozeOrganization:
+    async def test_from_snoozed(
+        self,
+        mocker: MockerFixture,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        organization.status = OrganizationStatus.SNOOZED
+        enqueue_job_mock = mocker.patch("polar.organization.service.enqueue_job")
+
+        result = await organization_service.unsnooze_organization(session, organization)
+
+        assert result.status == OrganizationStatus.REVIEW
+        assert result.status_updated_at is not None
+        enqueue_job_mock.assert_called_once_with(
+            "organization.under_review", organization_id=organization.id
+        )
+
+    async def test_from_non_snoozed_raises(
+        self,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        organization.status = OrganizationStatus.REVIEW
+
+        with pytest.raises(Exception, match="Only snoozed organizations"):
+            await organization_service.unsnooze_organization(session, organization)
+
+
+@pytest.mark.asyncio
+class TestSetPayoutAccount:
+    @pytest.mark.auth
+    async def test_set_payout_account_on_organization(
+        self,
+        session: AsyncSession,
+        save_fixture: SaveFixture,
+        auth_subject: AuthSubject[User],
+        organization: Organization,
+        user_organization: UserOrganization,
+        user: User,
+    ) -> None:
+        """Successfully sets the payout account on an organization."""
+        payout_account = await create_payout_account(
+            save_fixture, organization, user, type=PayoutAccountType.stripe
+        )
+        # Unlink from org first
+        organization.payout_account = None
+        await save_fixture(organization)
+
+        updated_org = await organization_service.set_payout_account(
+            session, auth_subject, organization, payout_account.id
+        )
+
+        assert updated_org.payout_account_id == payout_account.id
+
+    @pytest.mark.auth
+    async def test_set_unknown_payout_account_raises_error(
+        self,
+        session: AsyncSession,
+        save_fixture: SaveFixture,
+        auth_subject: AuthSubject[User],
+        organization: Organization,
+        user: User,
+    ) -> None:
+        """Raises PolarRequestValidationError for unknown payout account."""
+        with pytest.raises(PolarRequestValidationError):
+            await organization_service.set_payout_account(
+                session, auth_subject, organization, uuid.uuid4()
+            )
+
+
+@pytest.mark.asyncio
+class TestStatusTransitions:
+    """Tests for the organization status transition rules enforced in
+    Organization.set_status()."""
+
+    @pytest.mark.parametrize(
+        "current",
+        [
+            OrganizationStatus.CREATED,
+            OrganizationStatus.REVIEW,
+            OrganizationStatus.SNOOZED,
+            OrganizationStatus.ACTIVE,
+            OrganizationStatus.DENIED,
+            OrganizationStatus.OFFBOARDING,
+        ],
+    )
+    async def test_every_status_can_go_to_blocked(
+        self,
+        current: OrganizationStatus,
+        organization: Organization,
+    ) -> None:
+        organization.status = current
+        organization.set_status(OrganizationStatus.BLOCKED)
+        assert organization.status == OrganizationStatus.BLOCKED
+
+    async def test_review_can_go_to_offboarding(
+        self,
+        organization: Organization,
+    ) -> None:
+        organization.status = OrganizationStatus.REVIEW
+        organization.set_status(OrganizationStatus.OFFBOARDING)
+        assert organization.status == OrganizationStatus.OFFBOARDING
+
+    @pytest.mark.parametrize(
+        "current",
+        [
+            OrganizationStatus.CREATED,
+            OrganizationStatus.SNOOZED,
+            OrganizationStatus.ACTIVE,
+            OrganizationStatus.DENIED,
+            OrganizationStatus.BLOCKED,
+        ],
+    )
+    async def test_only_review_can_go_to_offboarding(
+        self,
+        current: OrganizationStatus,
+        organization: Organization,
+    ) -> None:
+        organization.status = current
+        with pytest.raises(InvalidStatusTransitionError):
+            organization.set_status(OrganizationStatus.OFFBOARDING)
+
+    @pytest.mark.parametrize(
+        "current",
+        [OrganizationStatus.DENIED, OrganizationStatus.BLOCKED],
+    )
+    async def test_reactivation_requires_reason(
+        self,
+        current: OrganizationStatus,
+        mocker: MockerFixture,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        organization.status = current
+        mocker.patch("polar.organization.service.enqueue_job")
+
+        with pytest.raises(OrganizationError):
+            await organization_service.confirm_organization_reviewed(
+                session, organization, 15000
+            )
+
+    @pytest.mark.parametrize(
+        ("current", "expected_note_fragment"),
+        [
+            (OrganizationStatus.DENIED, "reactivated from denied"),
+            (OrganizationStatus.BLOCKED, "unblocked"),
+        ],
+    )
+    async def test_reactivation_with_reason_succeeds(
+        self,
+        current: OrganizationStatus,
+        expected_note_fragment: str,
+        mocker: MockerFixture,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        organization.status = current
+        organization.initially_reviewed_at = datetime(2025, 1, 1, 12, 0, tzinfo=UTC)
+        mocker.patch("polar.organization.service.enqueue_job")
+
+        result = await organization_service.confirm_organization_reviewed(
+            session, organization, 15000, reason="Merchant provided additional docs"
+        )
+
+        assert result.status == OrganizationStatus.ACTIVE
+        assert result.internal_notes is not None
+        assert expected_note_fragment in result.internal_notes
+        assert "Merchant provided additional docs" in result.internal_notes
+
+    async def test_self_transition_is_noop(
+        self,
+        organization: Organization,
+    ) -> None:
+        organization.status = OrganizationStatus.BLOCKED
+        organization.set_status(OrganizationStatus.BLOCKED)
+        assert organization.status == OrganizationStatus.BLOCKED
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            OrganizationStatus.CREATED,
+            OrganizationStatus.REVIEW,
+            OrganizationStatus.SNOOZED,
+            OrganizationStatus.DENIED,
+            OrganizationStatus.OFFBOARDING,
+        ],
+    )
+    async def test_blocked_only_transitions_to_active(
+        self,
+        target: OrganizationStatus,
+        organization: Organization,
+    ) -> None:
+        organization.status = OrganizationStatus.BLOCKED
+        with pytest.raises(InvalidStatusTransitionError):
+            organization.set_status(target)
+
+
+@pytest.mark.asyncio
+class TestCapabilityOverrides:
+    """Capability overrides flip enforcement gates without changing status."""
+
+    async def test_checkout_payments_override_blocks_active_org(
+        self,
+        organization: Organization,
+    ) -> None:
+        organization.set_status(OrganizationStatus.ACTIVE)
+        assert organization.capabilities is not None
+        organization.capabilities = {
+            **organization.capabilities,
+            "checkout_payments": False,
+        }
+
+        assert organization.can_accept_payments is False
+        assert (
+            organization_service.is_organization_ready_for_payment(organization)
+            is False
+        )
+
+    async def test_can_authenticate_follows_api_access_capability(
+        self,
+        organization: Organization,
+    ) -> None:
+        organization.set_status(OrganizationStatus.ACTIVE)
+        assert organization.can_authenticate is True
+        assert organization.capabilities is not None
+
+        organization.capabilities = {
+            **organization.capabilities,
+            "api_access": False,
+        }
+        assert organization.can_authenticate is False
+
+    async def test_can_access_dashboard_follows_dashboard_access_capability(
+        self,
+        organization: Organization,
+    ) -> None:
+        organization.set_status(OrganizationStatus.ACTIVE)
+        assert organization.can_access_dashboard is True
+        assert organization.capabilities is not None
+
+        organization.capabilities = {
+            **organization.capabilities,
+            "dashboard_access": False,
+        }
+        assert organization.can_access_dashboard is False
+
+
+@pytest.mark.asyncio
+class TestSetStatusCapabilities:
+    @pytest.mark.parametrize("status", list(OrganizationStatus))
+    async def test_set_status_writes_capabilities(
+        self,
+        status: OrganizationStatus,
+        organization: Organization,
+    ) -> None:
+        # Bypass set_status's transition validation: this test verifies the
+        # capability mapping for each status, not the transition rules.
+        organization.status = status
+        organization.set_status(status)
+
+        assert organization.status == status
+        assert organization.capabilities == STATUS_CAPABILITIES[status]
+
+    async def test_set_status_overwrites_prior_overrides(
+        self,
+        organization: Organization,
+    ) -> None:
+        organization.set_status(OrganizationStatus.ACTIVE)
+        assert organization.capabilities is not None
+        organization.capabilities = {**organization.capabilities, "payouts": False}
+
+        organization.set_status(OrganizationStatus.BLOCKED)
+
+        assert (
+            organization.capabilities == STATUS_CAPABILITIES[OrganizationStatus.BLOCKED]
+        )
+
+
+@pytest.mark.asyncio
+class TestSetCapability:
+    async def test_flips_value(
+        self,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        organization.set_status(OrganizationStatus.ACTIVE)
+        assert organization.capabilities is not None
+        assert organization.capabilities["payouts"] is True
+
+        result = await organization_service.set_capability(
+            session,
+            organization,
+            "payouts",
+            False,
+            reason="Investigating suspicious withdrawal pattern",
+        )
+
+        assert result.capabilities is not None
+        assert result.capabilities["payouts"] is False
+        assert result.capabilities["checkout_payments"] is True
+
+    async def test_appends_internal_note_with_reason(
+        self,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        organization.set_status(OrganizationStatus.ACTIVE)
+        organization.internal_notes = None
+
+        await organization_service.set_capability(
+            session,
+            organization,
+            "payouts",
+            False,
+            reason="Manual ops hold",
+            admin_email="ops@polar.sh",
+        )
+
+        assert organization.internal_notes is not None
+        assert (
+            "Capability 'payouts' disabled by ops@polar.sh"
+            in organization.internal_notes
+        )
+        assert "Reason: Manual ops hold" in organization.internal_notes
+
+    async def test_noop_when_unchanged(
+        self,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        organization.set_status(OrganizationStatus.ACTIVE)
+        organization.internal_notes = None
+        initial = dict(organization.capabilities or {})
+
+        await organization_service.set_capability(
+            session,
+            organization,
+            "payouts",
+            True,
+            reason="Already enabled, should not change",
+        )
+
+        assert organization.capabilities == initial
+        assert organization.internal_notes is None
+
+    async def test_status_transition_resets_override(
+        self,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        organization.set_status(OrganizationStatus.ACTIVE)
+        await organization_service.set_capability(
+            session,
+            organization,
+            "payouts",
+            False,
+            reason="Temporary hold for KYC recheck",
+        )
+        assert organization.capabilities is not None
+        assert organization.capabilities["payouts"] is False
+
+        organization.set_status(OrganizationStatus.REVIEW)
+        assert organization.capabilities is not None
+        # REVIEW default for payouts is False, and checkout_payments defaults True.
+        assert organization.capabilities["checkout_payments"] is True

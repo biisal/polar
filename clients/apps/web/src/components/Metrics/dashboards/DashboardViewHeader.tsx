@@ -9,6 +9,8 @@ import {
   useMetricDashboards,
   useUpdateMetricDashboard,
 } from '@/hooks/queries/metrics'
+import { getServerURL } from '@/utils/api'
+import { METRIC_GROUPS, toISODate } from '@/utils/metrics'
 import MoreVertOutlined from '@mui/icons-material/MoreVertOutlined'
 import { schemas } from '@polar-sh/client'
 import Button from '@polar-sh/ui/components/atoms/Button'
@@ -21,7 +23,8 @@ import {
 } from '@polar-sh/ui/components/atoms/DropdownMenu'
 import { usePathname, useRouter } from 'next/navigation'
 import { useCallback, useMemo } from 'react'
-import { MetricsHeader } from './MetricsHeader'
+import { twMerge } from 'tailwind-merge'
+import { useMetricsFilters } from './useMetricsFilters'
 
 const BUILT_IN_NAMES: Record<string, string> = {
   revenue: 'Revenue',
@@ -37,18 +40,9 @@ const BUILT_IN_NAMES: Record<string, string> = {
 const UUID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
-interface DashboardViewHeaderProps {
-  organization: schemas['Organization']
-  earliestDateISOString: string
-}
-
-export function DashboardViewHeader({
-  organization,
-  earliestDateISOString,
-}: DashboardViewHeaderProps) {
+function useCurrentDashboard(organization: schemas['Organization']) {
   const pathname = usePathname()
   const { data: customDashboards } = useMetricDashboards(organization.id)
-  const { isShown: isEditShown, show: showEdit, hide: hideEdit } = useModal()
 
   const currentSlug = useMemo(() => {
     const parts = pathname.split('/')
@@ -76,28 +70,90 @@ export function DashboardViewHeader({
     return currentDashboard?.name ?? null
   }, [currentSlug, currentDashboard])
 
+  return { currentSlug, isCustomDashboard, currentDashboard, dashboardName }
+}
+
+export function DashboardViewTitle({
+  organization,
+}: {
+  organization: schemas['Organization']
+}) {
+  const { dashboardName } = useCurrentDashboard(organization)
+  if (!dashboardName) return null
   return (
-    <div className="flex w-full items-center justify-between gap-x-4">
-      {dashboardName ? (
-        <h3 className="text-xl font-medium whitespace-nowrap dark:text-white">
-          {dashboardName}
-        </h3>
-      ) : (
-        <span />
-      )}
-      <div className="flex items-center gap-x-6">
-        <MetricsHeader
+    <h3 className="text-xl font-medium whitespace-nowrap dark:text-white">
+      {dashboardName}
+    </h3>
+  )
+}
+
+interface DashboardViewActionsProps {
+  organization: schemas['Organization']
+  earliestDateISOString: string
+  className?: string
+}
+
+export function DashboardViewActions({
+  organization,
+  earliestDateISOString,
+  className,
+}: DashboardViewActionsProps) {
+  const { isShown: isEditShown, show: showEdit, hide: hideEdit } = useModal()
+
+  const { interval, startDate, endDate, productId } = useMetricsFilters(
+    earliestDateISOString,
+  )
+
+  const { currentSlug, isCustomDashboard, currentDashboard } =
+    useCurrentDashboard(organization)
+
+  const metricsForExport = useMemo(() => {
+    if (isCustomDashboard && currentDashboard) {
+      return currentDashboard.metrics
+    }
+    if (currentSlug) {
+      const group = METRIC_GROUPS.find(
+        (g) => g.category.toLowerCase().replace(/\s+/g, '-') === currentSlug,
+      )
+      return group ? group.metrics.map((m) => m.slug) : []
+    }
+    return []
+  }, [isCustomDashboard, currentDashboard, currentSlug])
+
+  const handleExport = useCallback(() => {
+    const url = new URL(`${getServerURL()}/v1/metrics/export`)
+    url.searchParams.set('organization_id', organization.id)
+    url.searchParams.set('start_date', toISODate(startDate))
+    url.searchParams.set('end_date', toISODate(endDate))
+    url.searchParams.set('interval', interval)
+    url.searchParams.set(
+      'timezone',
+      Intl.DateTimeFormat().resolvedOptions().timeZone,
+    )
+    productId?.forEach((id) => url.searchParams.append('product_id', id))
+    metricsForExport.forEach((m) => url.searchParams.append('metrics', m))
+    window.open(url.toString(), '_blank')
+  }, [
+    organization.id,
+    startDate,
+    endDate,
+    interval,
+    productId,
+    metricsForExport,
+  ])
+
+  return (
+    <div className={twMerge('flex items-center', className)}>
+      {isCustomDashboard && currentDashboard ? (
+        <DashboardDotMenu
           organization={organization}
-          earliestDateISOString={earliestDateISOString}
+          dashboard={currentDashboard}
+          onEdit={showEdit}
+          onExport={handleExport}
         />
-        {isCustomDashboard && currentDashboard && (
-          <DashboardDotMenu
-            organization={organization}
-            dashboard={currentDashboard}
-            onEdit={showEdit}
-          />
-        )}
-      </div>
+      ) : (
+        <ExportMenu onExport={handleExport} />
+      )}
       {currentDashboard && (
         <Modal
           title="Edit Dashboard"
@@ -118,14 +174,31 @@ export function DashboardViewHeader({
 
 // ─── Dot menu ────────────────────────────────────────────────────────────────
 
+function ExportMenu({ onExport }: { onExport: () => void }) {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button size="icon" variant="secondary" className="h-8 w-8">
+          <MoreVertOutlined fontSize="small" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        <DropdownMenuItem onClick={onExport}>Export</DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
 function DashboardDotMenu({
   organization,
   dashboard,
   onEdit,
+  onExport,
 }: {
   organization: schemas['Organization']
   dashboard: schemas['MetricDashboardSchema']
   onEdit: () => void
+  onExport: () => void
 }) {
   const router = useRouter()
   const deleteMutation = useDeleteMetricDashboard(dashboard.id, organization.id)
@@ -150,6 +223,8 @@ function DashboardDotMenu({
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end">
+          <DropdownMenuItem onClick={onExport}>Export</DropdownMenuItem>
+          <DropdownMenuSeparator />
           <DropdownMenuItem onClick={onEdit}>Edit</DropdownMenuItem>
           <DropdownMenuSeparator />
           <DropdownMenuItem destructive onClick={showDelete}>

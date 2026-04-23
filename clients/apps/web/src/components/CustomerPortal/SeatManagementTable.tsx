@@ -5,7 +5,7 @@ import {
   useCustomerSeats,
   useResendSeatInvitation,
   useRevokeSeat,
-} from '@/hooks/queries'
+} from '@/hooks/queries/customerPortal'
 import { validateEmail } from '@/utils/validation'
 import MoreVertOutlined from '@mui/icons-material/MoreVertOutlined'
 import { Client, schemas } from '@polar-sh/client'
@@ -58,7 +58,6 @@ interface SeatManagementTableProps {
   api: Client
   identifier: SeatBasedSubscription | SeatBasedOrder
   prorationBehavior?: schemas['CustomerOrganization']['proration_behavior']
-  pendingUpdate?: schemas['PendingSubscriptionUpdate'] | null
 }
 
 function isSeatBasedSubscription(
@@ -71,7 +70,6 @@ export const SeatManagementTable = ({
   api,
   identifier,
   prorationBehavior,
-  pendingUpdate,
 }: SeatManagementTableProps) => {
   const { data: seatsData, isLoading: isLoadingSeats } = useCustomerSeats(
     api,
@@ -194,7 +192,6 @@ export const SeatManagementTable = ({
           totalSeats={totalSeats}
           availableSeats={availableSeats}
           prorationBehavior={prorationBehavior}
-          pendingUpdate={pendingUpdate}
         />
       )}
 

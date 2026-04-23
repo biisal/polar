@@ -120,6 +120,11 @@ deploy() {
         uv run task emails
     fi
 
+    # Built every deploy (not gated on BACKEND_CHANGED): assets are
+    # gitignored so they can be missing even when backend is unchanged.
+    log "Building backoffice assets"
+    uv run task backoffice
+
     # --- Backend .env (must be written before migrations) ---
     log "Writing backend .env"
     local PREVIEW_URL="https://${TS_HOSTNAME}/${PREVIEW_PATH_PREFIX}"

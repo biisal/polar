@@ -2,8 +2,9 @@ from collections.abc import Sequence
 from typing import Unpack
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import Select, select
 
+from polar.authz.types import AccessibleOrganizationID
 from polar.kit.repository import (
     Options,
     RepositoryBase,
@@ -33,6 +34,15 @@ class BenefitGrantRepository(
     RepositoryBase[BenefitGrant],
 ):
     model = BenefitGrant
+
+    def get_statement_by_org_ids(
+        self, org_ids: set[AccessibleOrganizationID]
+    ) -> Select[tuple[BenefitGrant]]:
+        statement = self.get_base_statement().join(
+            Benefit, BenefitGrant.benefit_id == Benefit.id
+        )
+        statement = statement.where(Benefit.organization_id.in_(org_ids))
+        return statement
 
     async def get_by_benefit_and_scope(
         self,

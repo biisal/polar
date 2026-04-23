@@ -245,6 +245,10 @@ describe('middleware function', () => {
   })
 
   it('should throw error on unexpected API response status', async () => {
+    const consoleErrorSpy = vi
+      .spyOn(console, 'error')
+      .mockImplementation(() => {})
+
     createServerSideAPI.mockResolvedValue({
       GET: vi.fn().mockResolvedValue({
         data: undefined,
@@ -258,6 +262,7 @@ describe('middleware function', () => {
     await expect(proxy(request)).rejects.toThrow(
       'Unexpected response status while fetching authenticated user',
     )
+    consoleErrorSpy.mockRestore()
   })
 
   it('should handle 401 responses gracefully', async () => {
@@ -275,5 +280,20 @@ describe('middleware function', () => {
 
     expect(response.status).toBe(307)
     expect(response.headers.get('location')).toContain('/login')
+  })
+
+  it('should redirect unauthenticated /to/* requests to login preserving the deep link', async () => {
+    const request = new NextRequest(
+      'https://example.com/to/dashboard/settings/billing',
+    )
+
+    const response = await proxy(request)
+
+    expect(response.status).toBe(307)
+    const location = response.headers.get('location')
+    expect(location).toContain('/login')
+    expect(location).toContain(
+      'return_to=%2Fto%2Fdashboard%2Fsettings%2Fbilling',
+    )
   })
 })

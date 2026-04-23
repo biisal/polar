@@ -1,4 +1,5 @@
 import { useCustomerPortalContext } from '@/components/CustomerPortal/CustomerPortalProvider'
+import { extractApiErrorMessage } from '@/utils/api/errors'
 import { getQueryClient } from '@/utils/api/query'
 import { Client, operations, schemas, unwrap } from '@polar-sh/client'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -49,6 +50,73 @@ export function useCustomerPortalCustomer(options?: {
     error: query.error,
     update,
   }
+}
+
+export const useCustomerEmailUpdateRequest = () => {
+  const { client } = useCustomerPortalContext()
+
+  return useMutation({
+    mutationFn: async (data: { email: string }) => {
+      const result = await client.POST(
+        '/v1/customer-portal/customers/me/email-update/request',
+        { body: data },
+      )
+      if (result.error) {
+        const detail = (result.error as Record<string, unknown>)?.detail
+        if (result.response.status === 422 && Array.isArray(detail)) {
+          const err = new Error('Validation error') as Error & {
+            errors: schemas['ValidationError'][]
+          }
+          err.errors = detail
+          throw err
+        }
+        throw new Error(
+          typeof detail === 'string'
+            ? detail
+            : 'Failed to request email change',
+        )
+      }
+      return result
+    },
+  })
+}
+
+export const useCustomerEmailUpdateVerify = () => {
+  const { client } = useCustomerPortalContext()
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: async (data: { token: string }) => {
+      const result = await client.POST(
+        '/v1/customer-portal/customers/me/email-update/verify',
+        { body: data },
+      )
+      if (result.error) {
+        const detail = (result.error as Record<string, unknown>)?.detail
+        if (result.response.status === 401) {
+          throw new Error('This link is invalid or has expired.')
+        }
+        if (result.response.status === 422 && Array.isArray(detail)) {
+          const err = new Error('Validation error') as Error & {
+            errors: schemas['ValidationError'][]
+          }
+          err.errors = detail
+          throw err
+        }
+        throw new Error(
+          typeof detail === 'string'
+            ? detail
+            : 'Something went wrong. Please try again.',
+        )
+      }
+      return result.data
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: ['customer-portal', 'customer'],
+      })
+    },
+  })
 }
 
 export const useCustomerPortalSessionRequest = (
@@ -507,16 +575,6 @@ export const useResendSeatInvitation = (api: Client) =>
       return result
     },
   })
-
-// Member management hooks
-const extractApiErrorMessage = (
-  error: { detail?: string | { msg?: string }[] },
-  fallback: string,
-): string => {
-  if (typeof error?.detail === 'string') return error.detail
-  if (Array.isArray(error?.detail)) return error.detail[0]?.msg || fallback
-  return fallback
-}
 
 export const useCustomerPortalMembers = (api: Client) =>
   useQuery({

@@ -1,3 +1,4 @@
+import secrets
 from typing import Annotated, cast
 
 from fastapi import Depends, Query, Request
@@ -7,11 +8,13 @@ from sse_starlette import EventSourceResponse
 
 from polar.auth.models import Anonymous, Organization, User
 from polar.auth.models import AuthSubject as AuthSubjectType
+from polar.authz.service import get_accessible_org_ids
 from polar.checkout.repository import CheckoutRepository
 from polar.eventstream.endpoints import subscribe
 from polar.eventstream.service import Receivers
 from polar.exceptions import BadRequest, NotPermitted, ResourceNotFound
 from polar.models import CustomerSeat, Order, Product, Subscription
+from polar.models.checkout import CheckoutStatus
 from polar.models.customer_seat import SeatStatus
 from polar.openapi import APITag
 from polar.order.repository import OrderRepository
@@ -93,6 +96,28 @@ async def assign_seat(
 
         if not checkout:
             raise ResourceNotFound("Checkout not found")
+
+        if isinstance(auth_subject.subject, Anonymous):
+            if seat_assign.checkout_client_secret is None or not secrets.compare_digest(
+                seat_assign.checkout_client_secret, checkout.client_secret
+            ):
+                raise NotPermitted(
+                    "checkout_client_secret is required and must match the "
+                    "checkout when assigning seats as an anonymous caller."
+                )
+        elif seat_assign.checkout_client_secret is not None:
+            if not secrets.compare_digest(
+                seat_assign.checkout_client_secret, checkout.client_secret
+            ):
+                raise NotPermitted("checkout_client_secret does not match.")
+
+        if checkout.status != CheckoutStatus.succeeded:
+            raise NotPermitted("Seats can only be assigned from a successful checkout.")
+
+        if checkout.is_expired:
+            raise NotPermitted(
+                "Seats can no longer be assigned from this checkout because it has expired."
+            )
 
         # Try to find subscription first (for recurring purchases)
         subscription = await subscription_repository.get_by_checkout_id(
@@ -245,9 +270,10 @@ async def revoke_seat(
 
     typed_auth_subject = cast(AuthSubjectType[User | Organization], auth_subject)
     seat_repository = CustomerSeatRepository.from_session(session)
+    org_ids = await get_accessible_org_ids(session, typed_auth_subject)
 
-    seat = await seat_repository.get_by_id_and_auth_subject(
-        typed_auth_subject,
+    seat = await seat_repository.get_by_id_and_org_ids(
+        org_ids,
         seat_id,
         options=seat_repository.get_eager_options(),
     )
@@ -288,9 +314,10 @@ async def resend_invitation(
 
     typed_auth_subject = cast(AuthSubjectType[User | Organization], auth_subject)
     seat_repository = CustomerSeatRepository.from_session(session)
+    org_ids = await get_accessible_org_ids(session, typed_auth_subject)
 
-    seat = await seat_repository.get_by_id_and_auth_subject(
-        typed_auth_subject,
+    seat = await seat_repository.get_by_id_and_org_ids(
+        org_ids,
         seat_id,
         options=seat_repository.get_eager_options(),
     )

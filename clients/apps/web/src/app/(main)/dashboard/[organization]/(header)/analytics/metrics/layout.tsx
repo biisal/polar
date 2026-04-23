@@ -1,6 +1,10 @@
 import { DashboardBody } from '@/components/Layout/DashboardLayout'
 import { DashboardsListSidebar } from '@/components/Metrics/dashboards/DashboardsListSidebar'
-import { DashboardViewHeader } from '@/components/Metrics/dashboards/DashboardViewHeader'
+import {
+  DashboardViewActions,
+  DashboardViewTitle,
+} from '@/components/Metrics/dashboards/DashboardViewHeader'
+import { MetricsHeader } from '@/components/Metrics/dashboards/MetricsHeader'
 import { getServerSideAPI } from '@/utils/client/serverside'
 import { METRIC_GROUPS } from '@/utils/metrics'
 import { getOrganizationBySlugOrNotFound } from '@/utils/organization'
@@ -24,7 +28,7 @@ export default async function Layout(props: {
           query: {
             organization_id: organization.id,
             limit: 100,
-            is_archived: false,
+            is_archived: null,
           },
         },
       }),
@@ -33,7 +37,6 @@ export default async function Layout(props: {
   ])
 
   const hasRecurringProducts = products.items.some((p) => p.is_recurring)
-  const revopsEnabled = organization.feature_settings?.revops_enabled ?? false
 
   const defaultDashboards = METRIC_GROUPS.map((g) => ({
     slug: g.category.toLowerCase().replace(/\s+/g, '-'),
@@ -42,19 +45,31 @@ export default async function Layout(props: {
     if (slug === 'subscriptions' || slug === 'cancellations') {
       return hasRecurringProducts
     }
-    if (slug === 'costs') return revopsEnabled
     return true
   })
 
   return (
     <DashboardBody
       wide
-      title={null}
-      header={
-        <DashboardViewHeader
+      title={<DashboardViewTitle organization={organization} />}
+      titleActions={
+        <DashboardViewActions
           organization={organization}
           earliestDateISOString={limits.min_date}
         />
+      }
+      header={
+        <div className="flex w-full flex-col gap-4 md:w-auto md:flex-row md:items-center md:gap-x-6">
+          <MetricsHeader
+            organization={organization}
+            earliestDateISOString={limits.min_date}
+          />
+          <DashboardViewActions
+            organization={organization}
+            earliestDateISOString={limits.min_date}
+            className="hidden md:flex"
+          />
+        </div>
       }
       contextView={
         <DashboardsListSidebar
@@ -63,6 +78,7 @@ export default async function Layout(props: {
         />
       }
       contextViewPlacement="left"
+      contextViewTitle="Dashboards"
       contextViewClassName="md:max-w-[300px] xl:max-w-[320px]"
     >
       {props.children}

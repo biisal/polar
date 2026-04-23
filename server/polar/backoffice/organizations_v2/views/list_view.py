@@ -1,6 +1,7 @@
-"""Enhanced organization list view with tabs, smart grouping, and quick actions."""
+"""Enhanced organization list view with tabs and quick actions."""
 
 import contextlib
+import json
 from collections.abc import Generator
 from datetime import UTC, datetime
 
@@ -57,28 +58,6 @@ class OrganizationListView:
             delta = datetime.now(UTC) - org.status_updated_at
         return delta.days
 
-    def is_needs_attention(self, org: Organization) -> bool:
-        """Determine if organization needs immediate attention."""
-        days_in_status = self.calculate_days_in_status(org)
-
-        # Under review for more than 3 days
-        if org.is_under_review and days_in_status > 3:
-            return True
-
-        # Has pending appeal
-        if (
-            org.review
-            and org.review.appeal_submitted_at
-            and not org.review.appeal_reviewed_at
-        ):
-            return True
-
-        # High risk score
-        if org.review and org.review.risk_score and org.review.risk_score >= 80:
-            return True
-
-        return False
-
     @contextlib.contextmanager
     def sortable_header(
         self,
@@ -112,8 +91,6 @@ class OrganizationListView:
         if status_filter is not None:
             hx_vals_dict["status"] = status_filter.value
 
-        import json
-
         hx_vals = json.dumps(hx_vals_dict)
 
         with tag.th(
@@ -139,18 +116,61 @@ class OrganizationListView:
 
         yield
 
+    def pagination_controls(
+        self,
+        request: Request,
+        page: int,
+        has_more: bool,
+        current_sort: str,
+        current_direction: str,
+        status_filter: OrganizationStatus | None,
+    ) -> None:
+        """Render Previous/Next pagination buttons.
+
+        Uses the limit+1 has_more detection so we never pay for a COUNT(*) just
+        to render the page controls — works for tables of arbitrary size.
+        """
+        if page <= 1 and not has_more:
+            return
+
+        common_vals: dict[str, str | int] = {
+            "sort": current_sort,
+            "direction": current_direction,
+        }
+        if status_filter is not None:
+            common_vals["status"] = status_filter.value
+
+        def _nav_button(target_page: int, label: str, disabled: bool) -> None:
+            if disabled:
+                with tag.button(
+                    type="button", classes="join-item btn btn-sm", disabled=True
+                ):
+                    text(label)
+                return
+            hx_vals = {**common_vals, "page": target_page}
+            with tag.button(
+                type="button",
+                classes="join-item btn btn-sm",
+                hx_get=str(request.url_for("organizations:list")),
+                hx_vals=json.dumps(hx_vals),
+                hx_include="#filter-form",
+                hx_target="#org-list",
+            ):
+                text(label)
+
+        with tag.div(classes="flex justify-between items-center mt-6"):
+            with tag.div(classes="text-sm text-base-content/60"):
+                text(f"Page {page}")
+            with tag.div(classes="join"):
+                _nav_button(page - 1, "← Previous", disabled=page <= 1)
+                _nav_button(page + 1, "Next →", disabled=not has_more)
+
     @contextlib.contextmanager
     def organization_row(self, request: Request, org: Organization) -> Generator[None]:
         """Render a single organization row in the table."""
         days_in_status = self.calculate_days_in_status(org)
-        needs_attention = self.is_needs_attention(org)
 
-        # Row classes based on status/attention
-        row_class = "hover:bg-base-100"
-        if needs_attention:
-            row_class += " bg-error/5"
-
-        with tag.tr(classes=row_class):
+        with tag.tr(classes="hover:bg-base-100"):
             # Organization name and status
             with tag.td(classes="py-4 max-w-xs"):
                 with tag.div(classes="flex flex-col gap-1"):
@@ -249,6 +269,7 @@ class OrganizationListView:
         current_direction: str = "asc",
         countries: list[str] | None = None,
         selected_country: str | None = None,
+        selected_first_reviews: str | None = None,
     ) -> Generator[None]:
         """Render the complete list view."""
 
@@ -278,19 +299,17 @@ class OrganizationListView:
                 count=sum(status_counts.values()),
             ),
             Tab(
-                label="Initial Review",
-                url=str(request.url_for("organizations:list"))
-                + "?status=initial_review",
-                active=status_filter == OrganizationStatus.INITIAL_REVIEW,
-                count=status_counts.get(OrganizationStatus.INITIAL_REVIEW, 0),
+                label="Review",
+                url=str(request.url_for("organizations:list")) + "?status=review",
+                active=status_filter == OrganizationStatus.REVIEW,
+                count=status_counts.get(OrganizationStatus.REVIEW, 0),
                 badge_variant="warning",
             ),
             Tab(
-                label="Ongoing Review",
-                url=str(request.url_for("organizations:list"))
-                + "?status=ongoing_review",
-                active=status_filter == OrganizationStatus.ONGOING_REVIEW,
-                count=status_counts.get(OrganizationStatus.ONGOING_REVIEW, 0),
+                label="Snoozed",
+                url=str(request.url_for("organizations:list")) + "?status=snoozed",
+                active=status_filter == OrganizationStatus.SNOOZED,
+                count=status_counts.get(OrganizationStatus.SNOOZED, 0),
                 badge_variant="warning",
             ),
             Tab(
@@ -307,6 +326,20 @@ class OrganizationListView:
                 count=status_counts.get(OrganizationStatus.DENIED, 0),
                 badge_variant="error",
             ),
+            Tab(
+                label="Blocked",
+                url=str(request.url_for("organizations:list")) + "?status=blocked",
+                active=status_filter == OrganizationStatus.BLOCKED,
+                count=status_counts.get(OrganizationStatus.BLOCKED, 0),
+                badge_variant="error",
+            ),
+            Tab(
+                label="Offboarding",
+                url=str(request.url_for("organizations:list")) + "?status=offboarding",
+                active=status_filter == OrganizationStatus.OFFBOARDING,
+                count=status_counts.get(OrganizationStatus.OFFBOARDING, 0),
+                badge_variant="warning",
+            ),
         ]
 
         with tab_nav(tabs):
@@ -321,6 +354,17 @@ class OrganizationListView:
                 hx_trigger="submit, change from:.filter-select",
                 hx_target="#org-list",
             ):
+                # Preserve the active status tab across filter submissions.
+                # Without this, changing any filter drops the `status` query
+                # param and the listing falls back to the default view.
+                if status_filter is not None:
+                    with tag.input(
+                        type="hidden",
+                        name="status",
+                        value=status_filter.value,
+                    ):
+                        pass
+
                 # Search bar with filter toggle
                 with tag.div(classes="flex gap-3"):
                     # Search input
@@ -473,6 +517,26 @@ class OrganizationListView:
                                     with tag.option(value="none"):
                                         text("No Appeal")
 
+                            # Only meaningful on the Review tab
+                            if status_filter == OrganizationStatus.REVIEW:
+                                with tag.div():
+                                    with tag.label(classes="label"):
+                                        with tag.span(
+                                            classes="label-text text-xs font-semibold"
+                                        ):
+                                            text("First Reviews")
+                                    with tag.select(
+                                        classes="select select-bordered select-sm w-full filter-select",
+                                        name="first_reviews",
+                                    ):
+                                        with tag.option(value=""):
+                                            text("All")
+                                        first_review_attrs = {"value": "true"}
+                                        if selected_first_reviews == "true":
+                                            first_review_attrs["selected"] = ""
+                                        with tag.option(**first_review_attrs):
+                                            text("First Reviews (≤ $10)")
+
         # Organization table
         with tag.div(id="org-list", classes="overflow-x-auto"):
             if not organizations:
@@ -482,192 +546,88 @@ class OrganizationListView:
                 ):
                     pass
             else:
-                # Separate needs attention from regular
-                needs_attention = [
-                    org for org in organizations if self.is_needs_attention(org)
-                ]
-                regular_orgs = [
-                    org for org in organizations if not self.is_needs_attention(org)
-                ]
+                with tag.table(classes="table table-zebra w-full"):
+                    with tag.thead():
+                        with tag.tr():
+                            with self.sortable_header(
+                                request,
+                                "Organization",
+                                "name",
+                                current_sort,
+                                current_direction,
+                                status_filter=status_filter,
+                            ):
+                                pass
 
-                # Needs attention table
-                if needs_attention and status_filter is None:
-                    with tag.div(classes="mb-8"):
-                        with tag.h2(
-                            classes="text-xl font-bold mb-4 flex items-center gap-3"
-                        ):
-                            text("Needs Attention")
-                            with tag.span(classes="badge badge-error badge-lg"):
-                                text(str(len(needs_attention)))
+                            with self.sortable_header(
+                                request,
+                                "Country",
+                                "country",
+                                current_sort,
+                                current_direction,
+                                status_filter=status_filter,
+                            ):
+                                pass
 
-                        with tag.table(classes="table table-zebra w-full"):
-                            with tag.thead():
-                                with tag.tr():
-                                    with self.sortable_header(
-                                        request,
-                                        "Organization",
-                                        "name",
-                                        current_sort,
-                                        current_direction,
-                                        status_filter=status_filter,
-                                    ):
-                                        pass
+                            with self.sortable_header(
+                                request,
+                                "Created",
+                                "created",
+                                current_sort,
+                                current_direction,
+                                status_filter=status_filter,
+                            ):
+                                pass
 
-                                    with self.sortable_header(
-                                        request,
-                                        "Country",
-                                        "country",
-                                        current_sort,
-                                        current_direction,
-                                        status_filter=status_filter,
-                                    ):
-                                        pass
+                            with self.sortable_header(
+                                request,
+                                "In Status",
+                                "status_duration",
+                                current_sort,
+                                current_direction,
+                                "center",
+                                status_filter=status_filter,
+                            ):
+                                pass
 
-                                    with self.sortable_header(
-                                        request,
-                                        "Created",
-                                        "created",
-                                        current_sort,
-                                        current_direction,
-                                        status_filter=status_filter,
-                                    ):
-                                        pass
+                            with self.sortable_header(
+                                request,
+                                "Risk",
+                                "risk",
+                                current_sort,
+                                current_direction,
+                                "center",
+                                status_filter=status_filter,
+                            ):
+                                pass
 
-                                    with self.sortable_header(
-                                        request,
-                                        "In Status",
-                                        "status_duration",
-                                        current_sort,
-                                        current_direction,
-                                        "center",
-                                        status_filter=status_filter,
-                                    ):
-                                        pass
+                            with self.sortable_header(
+                                request,
+                                "Balance",
+                                "total_balance",
+                                current_sort,
+                                current_direction,
+                                "right",
+                                status_filter=status_filter,
+                            ):
+                                pass
 
-                                    with self.sortable_header(
-                                        request,
-                                        "Risk",
-                                        "risk",
-                                        current_sort,
-                                        current_direction,
-                                        "center",
-                                        status_filter=status_filter,
-                                    ):
-                                        pass
+                            with tag.th(classes="text-right"):
+                                text("Actions")
 
-                                    with self.sortable_header(
-                                        request,
-                                        "Balance",
-                                        "total_balance",
-                                        current_sort,
-                                        current_direction,
-                                        "right",
-                                        status_filter=status_filter,
-                                    ):
-                                        pass
+                    with tag.tbody():
+                        for org in organizations:
+                            with self.organization_row(request, org):
+                                pass
 
-                                    with tag.th(classes="text-right"):
-                                        text("Actions")
-
-                            with tag.tbody():
-                                for org in needs_attention:
-                                    with self.organization_row(request, org):
-                                        pass
-
-                    # Divider
-                    with tag.div(classes="divider my-8"):
-                        text("All Organizations")
-
-                # Regular organizations table
-                if regular_orgs or status_filter is not None:
-                    with tag.table(classes="table table-zebra w-full"):
-                        with tag.thead():
-                            with tag.tr():
-                                with self.sortable_header(
-                                    request,
-                                    "Organization",
-                                    "name",
-                                    current_sort,
-                                    current_direction,
-                                    status_filter=status_filter,
-                                ):
-                                    pass
-
-                                with self.sortable_header(
-                                    request,
-                                    "Country",
-                                    "country",
-                                    current_sort,
-                                    current_direction,
-                                    status_filter=status_filter,
-                                ):
-                                    pass
-
-                                with self.sortable_header(
-                                    request,
-                                    "Created",
-                                    "created",
-                                    current_sort,
-                                    current_direction,
-                                    status_filter=status_filter,
-                                ):
-                                    pass
-
-                                with self.sortable_header(
-                                    request,
-                                    "In Status",
-                                    "status_duration",
-                                    current_sort,
-                                    current_direction,
-                                    "center",
-                                    status_filter=status_filter,
-                                ):
-                                    pass
-
-                                with self.sortable_header(
-                                    request,
-                                    "Risk",
-                                    "risk",
-                                    current_sort,
-                                    current_direction,
-                                    "center",
-                                    status_filter=status_filter,
-                                ):
-                                    pass
-
-                                with self.sortable_header(
-                                    request,
-                                    "Balance",
-                                    "total_balance",
-                                    current_sort,
-                                    current_direction,
-                                    "right",
-                                    status_filter=status_filter,
-                                ):
-                                    pass
-
-                                with tag.th(classes="text-right"):
-                                    text("Actions")
-
-                        with tag.tbody():
-                            display_orgs = (
-                                regular_orgs if status_filter is None else organizations
-                            )
-                            for org in display_orgs:
-                                with self.organization_row(request, org):
-                                    pass
-
-                # Pagination
-                if has_more:
-                    with tag.div(classes="flex justify-center mt-6"):
-                        with button(
-                            variant="secondary",
-                            hx_get=str(request.url_for("organizations:list"))
-                            + f"?page={page + 1}",
-                            hx_target="#org-list",
-                            hx_swap="beforeend",
-                        ):
-                            text("Load More")
+                self.pagination_controls(
+                    request,
+                    page,
+                    has_more,
+                    current_sort,
+                    current_direction,
+                    status_filter,
+                )
 
         yield
 
@@ -677,7 +637,6 @@ class OrganizationListView:
         request: Request,
         organizations: list[Organization],
         status_filter: OrganizationStatus | None,
-        status_counts: dict[OrganizationStatus, int],
         page: int,
         has_more: bool,
         current_sort: str = "priority",
@@ -694,192 +653,88 @@ class OrganizationListView:
                 ):
                     pass
             else:
-                # Separate needs attention from regular
-                needs_attention = [
-                    org for org in organizations if self.is_needs_attention(org)
-                ]
-                regular_orgs = [
-                    org for org in organizations if not self.is_needs_attention(org)
-                ]
+                with tag.table(classes="table table-zebra w-full"):
+                    with tag.thead():
+                        with tag.tr():
+                            with self.sortable_header(
+                                request,
+                                "Organization",
+                                "name",
+                                current_sort,
+                                current_direction,
+                                status_filter=status_filter,
+                            ):
+                                pass
 
-                # Needs attention table
-                if needs_attention and status_filter is None:
-                    with tag.div(classes="mb-8"):
-                        with tag.h2(
-                            classes="text-xl font-bold mb-4 flex items-center gap-3"
-                        ):
-                            text("Needs Attention")
-                            with tag.span(classes="badge badge-error badge-lg"):
-                                text(str(len(needs_attention)))
+                            with self.sortable_header(
+                                request,
+                                "Country",
+                                "country",
+                                current_sort,
+                                current_direction,
+                                status_filter=status_filter,
+                            ):
+                                pass
 
-                        with tag.table(classes="table table-zebra w-full"):
-                            with tag.thead():
-                                with tag.tr():
-                                    with self.sortable_header(
-                                        request,
-                                        "Organization",
-                                        "name",
-                                        current_sort,
-                                        current_direction,
-                                        status_filter=status_filter,
-                                    ):
-                                        pass
+                            with self.sortable_header(
+                                request,
+                                "Created",
+                                "created",
+                                current_sort,
+                                current_direction,
+                                status_filter=status_filter,
+                            ):
+                                pass
 
-                                    with self.sortable_header(
-                                        request,
-                                        "Country",
-                                        "country",
-                                        current_sort,
-                                        current_direction,
-                                        status_filter=status_filter,
-                                    ):
-                                        pass
+                            with self.sortable_header(
+                                request,
+                                "In Status",
+                                "status_duration",
+                                current_sort,
+                                current_direction,
+                                "center",
+                                status_filter=status_filter,
+                            ):
+                                pass
 
-                                    with self.sortable_header(
-                                        request,
-                                        "Created",
-                                        "created",
-                                        current_sort,
-                                        current_direction,
-                                        status_filter=status_filter,
-                                    ):
-                                        pass
+                            with self.sortable_header(
+                                request,
+                                "Risk",
+                                "risk",
+                                current_sort,
+                                current_direction,
+                                "center",
+                                status_filter=status_filter,
+                            ):
+                                pass
 
-                                    with self.sortable_header(
-                                        request,
-                                        "In Status",
-                                        "status_duration",
-                                        current_sort,
-                                        current_direction,
-                                        "center",
-                                        status_filter=status_filter,
-                                    ):
-                                        pass
+                            with self.sortable_header(
+                                request,
+                                "Balance",
+                                "total_balance",
+                                current_sort,
+                                current_direction,
+                                "right",
+                                status_filter=status_filter,
+                            ):
+                                pass
 
-                                    with self.sortable_header(
-                                        request,
-                                        "Risk",
-                                        "risk",
-                                        current_sort,
-                                        current_direction,
-                                        "center",
-                                        status_filter=status_filter,
-                                    ):
-                                        pass
+                            with tag.th(classes="text-right"):
+                                text("Actions")
 
-                                    with self.sortable_header(
-                                        request,
-                                        "Balance",
-                                        "total_balance",
-                                        current_sort,
-                                        current_direction,
-                                        "right",
-                                        status_filter=status_filter,
-                                    ):
-                                        pass
+                    with tag.tbody():
+                        for org in organizations:
+                            with self.organization_row(request, org):
+                                pass
 
-                                    with tag.th(classes="text-right"):
-                                        text("Actions")
-
-                            with tag.tbody():
-                                for org in needs_attention:
-                                    with self.organization_row(request, org):
-                                        pass
-
-                    # Divider
-                    with tag.div(classes="divider my-8"):
-                        text("All Organizations")
-
-                # Regular organizations table
-                if regular_orgs or status_filter is not None:
-                    with tag.table(classes="table table-zebra w-full"):
-                        with tag.thead():
-                            with tag.tr():
-                                with self.sortable_header(
-                                    request,
-                                    "Organization",
-                                    "name",
-                                    current_sort,
-                                    current_direction,
-                                    status_filter=status_filter,
-                                ):
-                                    pass
-
-                                with self.sortable_header(
-                                    request,
-                                    "Country",
-                                    "country",
-                                    current_sort,
-                                    current_direction,
-                                    status_filter=status_filter,
-                                ):
-                                    pass
-
-                                with self.sortable_header(
-                                    request,
-                                    "Created",
-                                    "created",
-                                    current_sort,
-                                    current_direction,
-                                    status_filter=status_filter,
-                                ):
-                                    pass
-
-                                with self.sortable_header(
-                                    request,
-                                    "In Status",
-                                    "status_duration",
-                                    current_sort,
-                                    current_direction,
-                                    "center",
-                                    status_filter=status_filter,
-                                ):
-                                    pass
-
-                                with self.sortable_header(
-                                    request,
-                                    "Risk",
-                                    "risk",
-                                    current_sort,
-                                    current_direction,
-                                    "center",
-                                    status_filter=status_filter,
-                                ):
-                                    pass
-
-                                with self.sortable_header(
-                                    request,
-                                    "Balance",
-                                    "total_balance",
-                                    current_sort,
-                                    current_direction,
-                                    "right",
-                                    status_filter=status_filter,
-                                ):
-                                    pass
-
-                                with tag.th(classes="text-right"):
-                                    text("Actions")
-
-                        with tag.tbody():
-                            display_orgs = (
-                                regular_orgs if status_filter is None else organizations
-                            )
-                            for org in display_orgs:
-                                with self.organization_row(request, org):
-                                    pass
-
-                # Pagination
-                if has_more:
-                    with tag.div(classes="flex justify-center mt-6"):
-                        with button(
-                            variant="secondary",
-                            hx_get=str(request.url_for("organizations:list"))
-                            + f"?page={page + 1}",
-                            hx_target="#org-list",
-                            hx_swap="beforeend",
-                        ):
-                            text("Load More")
+                self.pagination_controls(
+                    request,
+                    page,
+                    has_more,
+                    current_sort,
+                    current_direction,
+                    status_filter,
+                )
 
         yield
 

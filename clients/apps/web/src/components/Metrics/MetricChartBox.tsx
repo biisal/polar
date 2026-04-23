@@ -4,6 +4,7 @@ import Spinner from '@/components/Shared/Spinner'
 import { ParsedMetricsResponse } from '@/hooks/queries'
 import { getFormattedMetricValue } from '@/utils/metrics'
 import ArrowOutwardOutlined from '@mui/icons-material/ArrowOutwardOutlined'
+import MoreVertOutlined from '@mui/icons-material/MoreVertOutlined'
 import { schemas } from '@polar-sh/client'
 import Button from '@polar-sh/ui/components/atoms/Button'
 import FormattedDateTime from '@polar-sh/ui/components/atoms/FormattedDateTime'
@@ -17,6 +18,12 @@ import {
 } from '@polar-sh/ui/components/atoms/Select'
 import ShadowBox from '@polar-sh/ui/components/atoms/ShadowBox'
 import { Status } from '@polar-sh/ui/components/atoms/Status'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@polar-sh/ui/components/ui/dropdown-menu'
 import {
   Tooltip,
   TooltipContent,
@@ -123,13 +130,33 @@ const MetricChartBox = ({
     [onHoverPeriodChange],
   )
 
+  const handleExport = useCallback(() => {
+    if (!data || !selectedMetric) return
+
+    const rows = [
+      ['Timestamp', selectedMetric.display_name],
+      ...data.periods.map((period) => [
+        period.timestamp.toISOString(),
+        String(period[metric] ?? ''),
+      ]),
+    ]
+    const csv = rows.map((row) => row.map((v) => `"${v}"`).join(',')).join('\n')
+    const blob = new Blob([csv], { type: 'text/csv' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `polar-${metric}.csv`
+    a.click()
+    URL.revokeObjectURL(url)
+  }, [data, metric, selectedMetric])
+
   const hoveredPeriod = useMemo(() => {
-    if (!data || !hoveredPeriodIndex) return null
+    if (!data || hoveredPeriodIndex == null) return null
     return data.periods[hoveredPeriodIndex]
   }, [data, hoveredPeriodIndex])
 
   const hoveredPreviousPeriod = useMemo(() => {
-    if (!previousData || !hoveredPeriodIndex) return null
+    if (!previousData || hoveredPeriodIndex == null) return null
     return previousData.periods[hoveredPeriodIndex]
   }, [previousData, hoveredPeriodIndex])
 
@@ -336,6 +363,20 @@ const MetricChartBox = ({
               <TooltipContent>Share Chart</TooltipContent>
             </Tooltip>
           )}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="hidden rounded-full opacity-0 transition-opacity group-hover:opacity-100 md:block"
+              >
+                <MoreVertOutlined fontSize="small" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onClick={handleExport}>Export</DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
       </div>
       <div

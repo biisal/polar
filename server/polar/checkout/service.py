@@ -12,6 +12,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import contains_eager, joinedload, selectinload
 
 from polar.auth.models import Anonymous, AuthSubject
+from polar.authz.service import get_accessible_org_ids
 from polar.checkout.guard import has_product_checkout
 from polar.checkout.schemas import (
     MINIMUM_PRICE_AMOUNT,
@@ -76,7 +77,6 @@ from polar.models import (
 from polar.models.checkout import CheckoutStatus
 from polar.models.checkout_product import CheckoutProduct
 from polar.models.customer import CustomerType
-from polar.models.discount import DiscountDuration
 from polar.models.order import OrderBillingReasonInternal
 from polar.models.product_price import ProductPriceSource
 from polar.models.webhook_endpoint import WebhookEventType
@@ -253,7 +253,8 @@ class CheckoutService:
         ],
     ) -> tuple[Sequence[Checkout], int]:
         repository = CheckoutRepository.from_session(session)
-        statement = repository.get_readable_statement(auth_subject).options(
+        org_ids = await get_accessible_org_ids(session, auth_subject)
+        statement = repository.get_statement_by_org_ids(org_ids).options(
             *repository.get_eager_options()
         )
 
@@ -290,8 +291,9 @@ class CheckoutService:
         id: uuid.UUID,
     ) -> Checkout | None:
         repository = CheckoutRepository.from_session(session)
+        org_ids = await get_accessible_org_ids(session, auth_subject)
         statement = (
-            repository.get_readable_statement(auth_subject)
+            repository.get_statement_by_org_ids(org_ids)
             .where(Checkout.id == id)
             .options(*repository.get_eager_options())
         )
@@ -300,7 +302,7 @@ class CheckoutService:
         if checkout is None:
             return None
 
-        if checkout.organization.is_blocked():
+        if not checkout.organization.can_authenticate:
             raise NotPermitted()
 
         return checkout
@@ -368,7 +370,7 @@ class CheckoutService:
                     ]
                 ) from e
 
-        if product.organization.is_blocked():
+        if not product.organization.can_authenticate:
             raise NotPermitted()
 
         if checkout_create.amount is not None and is_custom_price(price):
@@ -608,7 +610,7 @@ class CheckoutService:
         if not product.organization.feature_settings.get(
             "checkout_localization_enabled", False
         ):
-            checkout.locale = "en-US"
+            checkout.locale = "en"
 
         session.add(checkout)
 
@@ -844,7 +846,7 @@ class CheckoutService:
                 if locale is not None and isinstance(locale, str):
                     checkout.locale = locale
         else:
-            checkout.locale = "en-US"
+            checkout.locale = "en"
 
         session.add(checkout)
 
@@ -957,20 +959,13 @@ class CheckoutService:
                 }
             )
 
-        # Check if organization can accept payments
-        if not await organization_service.is_organization_ready_for_payment(
-            session, checkout.organization
+        if not organization_service.is_organization_ready_for_payment(
+            checkout.organization
         ):
             if checkout.is_payment_required:
                 raise PaymentNotReady()
-            # When a discount makes a checkout free, ensure it's a permanent
-            # (forever) discount to avoid starting charges once it expires
-            # without the organization having been reviewed.
-            if (
-                checkout.is_payment_setup_required
-                and checkout.discount is not None
-                and checkout.discount.duration != DiscountDuration.forever
-            ):
+
+            if checkout.is_payment_setup_required:
                 raise PaymentNotReady()
 
         # For wallet payments (Apple Pay, Google Pay, Link), we hide the customer name
@@ -1419,9 +1414,10 @@ class CheckoutService:
         product_price_id: uuid.UUID,
     ) -> tuple[Sequence[Product], Product, ProductPrice, str]:
         product_price_repository = ProductPriceRepository.from_session(session)
+        org_ids = await get_accessible_org_ids(session, auth_subject)
         price = await product_price_repository.get_readable_by_id(
             product_price_id,
-            auth_subject,
+            org_ids,
             options=(
                 contains_eager(ProductPrice.product).options(
                     joinedload(Product.organization)
@@ -2098,7 +2094,7 @@ class CheckoutService:
         if not checkout.organization.feature_settings.get(
             "checkout_localization_enabled", False
         ):
-            checkout.locale = "en-US"
+            checkout.locale = "en"
 
         checkout = await self._update_trial_end(checkout)
 

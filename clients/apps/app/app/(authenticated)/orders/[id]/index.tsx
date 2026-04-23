@@ -1,3 +1,4 @@
+import { CustomField } from '@/components/CustomFields/CustomField'
 import { CustomerRow } from '@/components/Customers/CustomerRow'
 import { Box } from '@/components/Shared/Box'
 import { DetailRow, Details } from '@/components/Shared/Details'
@@ -5,6 +6,7 @@ import { Pill } from '@/components/Shared/Pill'
 import { Text } from '@/components/Shared/Text'
 import { Touchable } from '@/components/Shared/Touchable'
 import { useTheme } from '@/design-system/useTheme'
+import { useCustomFields } from '@/hooks/polar/custom_fields'
 import { useOrder } from '@/hooks/polar/orders'
 import { formatCurrency } from '@polar-sh/currency'
 import * as Clipboard from 'expo-clipboard'
@@ -24,6 +26,9 @@ export default function Index() {
   const theme = useTheme()
 
   const { data: order, refetch, isRefetching } = useOrder(id as string)
+  const { data: customFields } = useCustomFields(
+    order?.customer.organization_id,
+  )
 
   if (!order) {
     return (
@@ -208,6 +213,28 @@ export default function Index() {
           value={order.customer.billing_address?.country}
         />
       </Details>
+
+      {customFields && customFields.items.length > 0 ? (
+        <Box>
+          <Text variant="subtitle" marginBottom="spacing-8">
+            Custom Fields
+          </Text>
+          <Box
+            backgroundColor="card"
+            padding="spacing-16"
+            borderRadius="border-radius-12"
+            gap="spacing-16"
+          >
+            {customFields.items.map((field) => (
+              <CustomField
+                key={field.id}
+                field={field}
+                value={order.custom_field_data?.[field.slug]}
+              />
+            ))}
+          </Box>
+        </Box>
+      ) : null}
 
       {order.metadata && Object.keys(order.metadata).length > 0 ? (
         <Box>

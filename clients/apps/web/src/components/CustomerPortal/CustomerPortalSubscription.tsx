@@ -4,7 +4,7 @@ import {
   useCustomerCancelSubscription,
   useCustomerOrders,
   usePortalAuthenticatedUser,
-} from '@/hooks/queries'
+} from '@/hooks/queries/customerPortal'
 import { hasBillingPermission } from '@/utils/customerPortal'
 import { Client, schemas } from '@polar-sh/client'
 import { formatCurrency } from '@polar-sh/currency'
@@ -15,7 +15,7 @@ import { useModal } from '../Modal/useModal'
 import { DownloadInvoicePortal } from '../Orders/DownloadInvoice'
 import AmountLabel from '../Shared/AmountLabel'
 import { DetailRow } from '../Shared/DetailRow'
-import CustomerCancellationModal from '../Subscriptions/CustomerCancellationModal'
+import CustomerCancellationModal from './CustomerCancellationModal'
 import { SubscriptionStatusLabel } from '../Subscriptions/utils'
 import { CustomerPortalGrants } from './CustomerPortalGrants'
 import { SeatManagementTable } from './SeatManagementTable'
@@ -24,10 +24,12 @@ const CustomerPortalSubscription = ({
   api,
   customerSessionToken,
   subscription,
+  products,
 }: {
   api: Client
   customerSessionToken: string
   subscription: schemas['CustomerSubscription']
+  products: schemas['CustomerProduct'][]
 }) => {
   const {
     show: showCancelModal,
@@ -46,6 +48,11 @@ const CustomerPortalSubscription = ({
   })
 
   const cancelSubscription = useCustomerCancelSubscription(api)
+
+  const pendingUpdate = subscription.pending_update
+  const pendingProduct = products.find(
+    (product) => product.id === pendingUpdate?.product_id,
+  )
 
   const hasInvoices = orders?.items && orders.items.length > 0
 
@@ -129,6 +136,35 @@ const CustomerPortalSubscription = ({
         )}
       </div>
 
+      {pendingUpdate && (
+        <div className="flex flex-col gap-y-2">
+          <h3>Pending Update</h3>
+          <div className="flex flex-col">
+            {pendingProduct && (
+              <DetailRow
+                label="New Product"
+                value={`${subscription.product.name} -> ${pendingProduct?.name}`}
+              />
+            )}
+            {pendingUpdate.seats !== null && (
+              <DetailRow
+                label="Seats"
+                value={`${subscription.seats} -> ${pendingUpdate.seats}`}
+              />
+            )}
+            <DetailRow
+              label="Update in effect from"
+              value={
+                <FormattedDateTime
+                  datetime={pendingUpdate.applies_at}
+                  dateStyle="long"
+                />
+              }
+            />
+          </div>
+        </div>
+      )}
+
       {/* Cancel button - only shown for users with billing permissions */}
       {!isCancelled && canManageBilling && (
         <Button
@@ -149,7 +185,6 @@ const CustomerPortalSubscription = ({
           prorationBehavior={
             subscription.product.organization.proration_behavior
           }
-          pendingUpdate={subscription.pending_update}
         />
       )}
 

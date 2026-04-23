@@ -1,5 +1,5 @@
 import revalidate from '@/app/actions'
-import { useCustomerOrders } from '@/hooks/queries'
+import { useCustomerOrders } from '@/hooks/queries/customerPortal'
 import { Client, schemas } from '@polar-sh/client'
 import Button from '@polar-sh/ui/components/atoms/Button'
 import { DataTable } from '@polar-sh/ui/components/atoms/DataTable'
@@ -10,7 +10,7 @@ import { useRouter } from 'next/navigation'
 import { useCallback, useMemo, useState } from 'react'
 import { InlineModal } from '../Modal/InlineModal'
 import { useModal } from '../Modal/useModal'
-import CustomerSubscriptionDetails from '../Subscriptions/CustomerSubscriptionDetails'
+import CustomerSubscriptionDetails from './CustomerSubscriptionDetails'
 import CustomerPortalSubscription from './CustomerPortalSubscription'
 import { OrderPaymentRetryModal } from './OrderPaymentRetryModal'
 
@@ -60,10 +60,12 @@ export const ActiveSubscriptionsOverview = ({
 interface SubscriptionsOverviewProps {
   organization: schemas['CustomerOrganization']
   subscriptions: schemas['CustomerSubscription'][]
+  products: schemas['CustomerProduct'][]
 }
 
 export const InactiveSubscriptionsOverview = ({
   subscriptions,
+  products,
   api,
   customerSessionToken,
 }: SubscriptionsOverviewProps) => {
@@ -208,6 +210,7 @@ export const InactiveSubscriptionsOverview = ({
                 api={api}
                 customerSessionToken={customerSessionToken}
                 subscription={selectedSubscription}
+                products={products}
               />
             </div>
           ) : null

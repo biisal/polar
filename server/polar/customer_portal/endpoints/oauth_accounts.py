@@ -8,7 +8,6 @@ from fastapi.responses import RedirectResponse
 from httpx_oauth.clients.github import GitHubOAuth2
 from httpx_oauth.exceptions import GetProfileError
 from httpx_oauth.oauth2 import BaseOAuth2, GetAccessTokenError
-from pydantic import UUID4
 
 from polar.auth.models import Customer, Member, is_anonymous, is_customer, is_member
 from polar.benefit.grant.repository import BenefitGrantRepository
@@ -16,7 +15,7 @@ from polar.benefit.strategies.base.service import BenefitActionRequiredError
 from polar.config import settings
 from polar.customer.repository import CustomerRepository
 from polar.customer_session.service import customer_session as customer_session_service
-from polar.exceptions import NotPermitted, PolarError
+from polar.exceptions import NotPermitted, PolarError, Unauthorized
 from polar.integrations.discord.oauth import user_client as discord_user_client
 from polar.kit import jwt
 from polar.kit.http import ReturnTo, add_query_parameters, get_safe_return_url
@@ -81,7 +80,6 @@ async def authorize(
     return_to: ReturnTo,
     auth_subject: auth.CustomerPortalOAuthAccount,
     platform: CustomerOAuthPlatform = Query(...),
-    customer_id: UUID4 = Query(...),
     session: AsyncSession = Depends(get_db_session),
 ) -> AuthorizeResponse:
     state: dict[str, str] = {
@@ -96,7 +94,9 @@ async def authorize(
     elif is_customer(auth_subject):
         state["customer_id"] = str(auth_subject.subject.id)
     else:
-        state["customer_id"] = str(customer_id)
+        # The callback mints a customer session from the signed state's
+        # customer_id, so that id must come from an authenticated subject.
+        raise Unauthorized()
 
     encoded_state = jwt.encode(
         data=state, secret=settings.SECRET, type="customer_oauth"
@@ -154,22 +154,6 @@ async def callback(
     platform = CustomerOAuthPlatform(state_data["platform"])
 
     redirect_url = get_safe_return_url(return_to)
-    # If not authenticated, create a session based on whether this is a member or customer flow
-    if is_anonymous(auth_subject):
-        if member is not None:
-            token, _ = await member_session_service.create_member_session(
-                session, member
-            )
-            redirect_url = add_query_parameters(
-                redirect_url, member_session_token=token
-            )
-        else:
-            token, _ = await customer_session_service.create_customer_session(
-                session, customer
-            )
-            redirect_url = add_query_parameters(
-                redirect_url, customer_session_token=token
-            )
 
     if code is None or error is not None:
         redirect_url = add_query_parameters(
@@ -209,6 +193,23 @@ async def callback(
             for k, v in _get_response_attributes(e.response).items():
                 span.set_attribute(k, v)
         return RedirectResponse(redirect_url, 303)
+
+    # Create a session only after the OAuth provider has confirmed the code.
+    if is_anonymous(auth_subject):
+        if member is not None:
+            token, _ = await member_session_service.create_member_session(
+                session, member
+            )
+            redirect_url = add_query_parameters(
+                redirect_url, member_session_token=token
+            )
+        else:
+            token, _ = await customer_session_service.create_customer_session(
+                session, customer
+            )
+            redirect_url = add_query_parameters(
+                redirect_url, customer_session_token=token
+            )
 
     try:
         profile = await client.get_profile(oauth2_token_data["access_token"])

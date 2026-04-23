@@ -222,11 +222,6 @@ class Settings(BaseSettings):
     APPLE_KEY_ID: str = ""
     APPLE_KEY_VALUE: str = ""
 
-    # Risk review — comma-separated codes that trigger visual warning flags
-    # in the backoffice overview.
-    RISK_COUNTRY_CODES: list[str] = []
-    RISK_CURRENCY_CODES: list[str] = []
-
     # Pydantic AI Gateway
     PYDANTIC_AI_GATEWAY_API_KEY: str = "DummyKey"
     PYDANTIC_AI_GATEWAY_MODEL: str = "openai:gpt-5.2-2025-12-11"
@@ -275,6 +270,7 @@ class Settings(BaseSettings):
         "icloud.com",
         "mail.com",
         "protonmail.com",
+        "proton.me",
         "zoho.com",
         "gmx.com",
         "yandex.com",
@@ -340,6 +336,9 @@ class Settings(BaseSettings):
             ]
         )
 
+    # Customer portal URL overrides per organization
+    CUSTOMER_PORTAL_URL_OVERRIDES: dict[str, str] = {}
+
     # Invoices
     S3_CUSTOMER_INVOICES_BUCKET_NAME: str = "polar-customer-invoices"
     S3_PAYOUT_INVOICES_BUCKET_NAME: str = "polar-payout-invoices"
@@ -399,6 +398,27 @@ class Settings(BaseSettings):
     }
     PLATFORM_FEE_BASIS_POINTS: int = 400
     PLATFORM_FEE_FIXED: int = 40
+
+    ORGANIZATION_BLOCKED_WORDS: list[str] = [
+        "porn",
+        "porno",
+        "pornography",
+        "sex",
+        "sexual",
+        "sexy",
+        "nsfw",
+        "xxx",
+        "hentai",
+        "erotic",
+        "erotica",
+        "fetish",
+        "nude",
+        "nudes",
+        "nudity",
+        "onlyfans",
+        "camgirl",
+        "escort",
+    ]
 
     ORGANIZATION_SLUG_RESERVED_KEYWORDS: list[str] = [
         # Landing pages

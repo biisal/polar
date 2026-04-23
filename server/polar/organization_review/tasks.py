@@ -2,11 +2,11 @@ import uuid
 from datetime import UTC, datetime
 
 import structlog
-from sqlalchemy.orm import joinedload
 
+from polar.config import Environment, settings
 from polar.exceptions import PolarTaskError
-from polar.integrations.plain.service import plain as plain_service
-from polar.models.organization import Organization, OrganizationStatus
+from polar.integrations.polar.service import polar_self
+from polar.models.organization import OrganizationStatus
 from polar.models.organization_review import OrganizationReview
 from polar.organization.repository import (
     OrganizationRepository,
@@ -20,7 +20,7 @@ from polar.worker import AsyncSessionMaker, TaskPriority, actor
 from .agent import run_organization_review
 from .report import build_agent_report
 from .repository import OrganizationReviewRepository
-from .schemas import ReviewContext, ReviewVerdict
+from .schemas import ActorType, DecisionType, ReviewContext, ReviewVerdict
 
 log = structlog.get_logger(__name__)
 
@@ -52,21 +52,21 @@ async def run_review_agent(
     organization_id: uuid.UUID,
     context: str = ReviewContext.THRESHOLD,
     auto_approve_eligible: bool = False,
+    plain_thread_id: str | None = None,  # kept for in-flight job compatibility
 ) -> None:
     """Run the organization review agent as a background task.
 
     For SUBMISSION context: creates an OrganizationReview record and auto-denies on DENY.
     For THRESHOLD context: log-only, persists to OrganizationAgentReview table.
     """
+    if settings.ENV == Environment.sandbox:
+        return
+
     review_context = ReviewContext(context)
 
     async with AsyncSessionMaker() as session:
         repository = OrganizationRepository.from_session(session)
-        organization = await repository.get_by_id(
-            organization_id,
-            include_blocked=True,
-            options=(joinedload(Organization.account),),
-        )
+        organization = await repository.get_by_id(organization_id, include_blocked=True)
         if organization is None:
             raise OrganizationDoesNotExist(organization_id)
 
@@ -81,9 +81,6 @@ async def run_review_agent(
                     "organization_review.threshold.agent_failed",
                     organization_id=str(organization_id),
                     slug=organization.slug,
-                )
-                await plain_service.create_organization_review_thread(
-                    session, organization
                 )
                 return
             raise
@@ -100,6 +97,16 @@ async def run_review_agent(
             model_used=result.model_used,
             duration_seconds=result.duration_seconds,
             estimated_cost_usd=result.usage.estimated_cost_usd,
+        )
+
+        polar_self.enqueue_track_organization_review_usage(
+            external_customer_id=str(organization_id),
+            review_context=review_context.value,
+            vendor=result.model_provider,
+            model=result.model_used,
+            input_tokens=result.usage.input_tokens,
+            output_tokens=result.usage.output_tokens,
+            cost_usd=result.usage.estimated_cost_usd,
         )
 
         # Persist agent report to its own table (both contexts)
@@ -120,8 +127,8 @@ async def run_review_agent(
             )
             if (
                 current_decision is not None
-                and current_decision.actor_type == "human"
-                and current_decision.review_context == "manual"
+                and current_decision.actor_type == ActorType.HUMAN
+                and current_decision.review_context == ReviewContext.MANUAL
             ):
                 auto_approve_eligible = False
                 log.info(
@@ -129,9 +136,6 @@ async def run_review_agent(
                     organization_id=str(organization_id),
                     slug=organization.slug,
                     verdict=report.verdict.value,
-                )
-                await plain_service.create_organization_review_thread(
-                    session, organization
                 )
 
         if review_context == ReviewContext.THRESHOLD and auto_approve_eligible:
@@ -149,9 +153,9 @@ async def run_review_agent(
                 await review_repository.record_agent_decision(
                     organization_id=organization_id,
                     agent_review_id=agent_review.id,
-                    decision="APPROVE",
-                    review_context="threshold",
-                    verdict=report.verdict.value,
+                    decision=DecisionType.APPROVE,
+                    review_context=ReviewContext.THRESHOLD,
+                    verdict=report.verdict,
                     risk_score=report.overall_risk_score,
                 )
 
@@ -203,16 +207,15 @@ async def run_review_agent(
 
             # Auto-deny on DENY — human will review the denial
             if report.verdict == ReviewVerdict.DENY:
-                organization.status = OrganizationStatus.DENIED
-                organization.status_updated_at = datetime.now(UTC)
+                organization.set_status(OrganizationStatus.DENIED)
                 session.add(organization)
 
                 await review_repository.record_agent_decision(
                     organization_id=organization_id,
                     agent_review_id=agent_review.id,
-                    decision="DENY",
-                    review_context="submission",
-                    verdict=report.verdict.value,
+                    decision=DecisionType.DENY,
+                    review_context=ReviewContext.SUBMISSION,
+                    verdict=report.verdict,
                     risk_score=report.overall_risk_score,
                 )
 
@@ -223,6 +226,4 @@ async def run_review_agent(
                     verdict=report.verdict.value,
                 )
             elif report.verdict == ReviewVerdict.APPROVE:
-                organization.status = OrganizationStatus.ACTIVE
-                organization.status_updated_at = datetime.now(UTC)
-                session.add(organization)
+                await organization_service.maybe_activate(session, organization)

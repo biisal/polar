@@ -1,1 +1,21 @@
+# Global code owners
+* @polarsource/engineering
+
+# Backend
+server/** @frankie567
+server/polar/metrics/** @Yopi @pieterbeulque
+server/tests/metrics/** @Yopi @pieterbeulque
+
+# Infrastructure
+terraform/** @Yopi
+infra/** @Yopi
+
+# Frontend
+clients/apps/web/src/components/Checkout/** @sebastianekstrom
+clients/packages/checkout/** @sebastianekstrom
+
+# Docs
+/docs/ @pieterbeulque
+
+# Other
 **/legal @victoriabolin @birkjernstrom

@@ -8,7 +8,6 @@ from sqlalchemy.orm import joinedload, selectinload
 from polar.auth.models import (
     AuthSubject,
     Member,
-    Organization,
     User,
     is_customer,
     is_member,
@@ -29,6 +28,7 @@ from polar.models import (
     Discount,
     Order,
     OrderItem,
+    Organization,
     Product,
     ProductPrice,
     Subscription,
@@ -90,13 +90,24 @@ class OrderRepository(
         return await self.get_one_or_none(statement)
 
     async def get_due_dunning_orders(self, *, options: Options = ()) -> Sequence[Order]:
-        """Get orders that are due for dunning retry based on next_payment_attempt_at."""
+        """Get orders that are due for dunning retry based on next_payment_attempt_at.
+
+        Skips orders for organizations whose ``subscription_renewals`` capability
+        is disabled — recurring billing pause covers both cycle and dunning.
+        """
 
         statement = (
             self.get_base_statement()
+            .join(Customer, Customer.id == Order.customer_id)
+            .join(
+                Organization,
+                Organization.id == Customer.organization_id,
+            )
             .where(
                 Order.next_payment_attempt_at.is_not(None),
                 Order.next_payment_attempt_at <= utc_now(),
+                Organization.is_deleted.is_(False),
+                Organization.can_renew_subscriptions.is_(True),
             )
             .order_by(Order.next_payment_attempt_at.asc())
             .options(*options)
@@ -121,6 +132,24 @@ class OrderRepository(
                 Subscription.past_due_deadline > utc_now(),
             )
             .options(joinedload(Order.subscription))
+        )
+        return await self.get_all(statement)
+
+    async def get_latest_by_customer_ids(
+        self,
+        customer_ids: Sequence[UUID],
+        *,
+        limit: int,
+        options: Options = (),
+    ) -> Sequence[Order]:
+        statement = (
+            self.get_base_statement()
+            .join(Customer, onclause=Customer.id == Order.customer_id)
+            .join(Product, onclause=Product.id == Order.product_id, isouter=True)
+            .where(Order.customer_id.in_(customer_ids))
+            .order_by(Order.created_at.desc())
+            .limit(limit)
+            .options(*options)
         )
         return await self.get_all(statement)
 

@@ -20,6 +20,7 @@ from polar.customer_seat.service import (
 from polar.enums import SubscriptionRecurringInterval
 from polar.kit.utils import utc_now
 from polar.models import (
+    Account,
     Customer,
     Organization,
     Product,
@@ -32,6 +33,7 @@ from polar.models.webhook_endpoint import WebhookEventType
 from polar.postgres import AsyncSession
 from tests.fixtures.database import SaveFixture
 from tests.fixtures.random_objects import (
+    create_account,
     create_customer,
     create_customer_seat,
     create_member,
@@ -45,26 +47,26 @@ from tests.fixtures.random_objects import (
 @pytest.mark.asyncio
 class TestCheckSeatFeatureEnabled:
     async def test_feature_enabled(
-        self, session: AsyncSession, save_fixture: SaveFixture
+        self, session: AsyncSession, save_fixture: SaveFixture, account: Account
     ) -> None:
-        organization = await create_organization(save_fixture)
+        organization = await create_organization(save_fixture, account)
         organization.feature_settings = {"seat_based_pricing_enabled": True}
         await save_fixture(organization)
         await seat_service.check_seat_feature_enabled(session, organization.id)
 
     async def test_feature_disabled(
-        self, session: AsyncSession, save_fixture: SaveFixture
+        self, session: AsyncSession, save_fixture: SaveFixture, account: Account
     ) -> None:
-        organization = await create_organization(save_fixture)
+        organization = await create_organization(save_fixture, account)
         organization.feature_settings = {"seat_based_pricing_enabled": False}
         await save_fixture(organization)
         with pytest.raises(FeatureNotEnabled):
             await seat_service.check_seat_feature_enabled(session, organization.id)
 
     async def test_feature_missing(
-        self, session: AsyncSession, save_fixture: SaveFixture
+        self, session: AsyncSession, save_fixture: SaveFixture, account: Account
     ) -> None:
-        organization = await create_organization(save_fixture)
+        organization = await create_organization(save_fixture, account)
         organization.feature_settings = {}
         await save_fixture(organization)
         with pytest.raises(FeatureNotEnabled):
@@ -650,9 +652,11 @@ class TestAssignSeat:
         self,
         session: AsyncSession,
         save_fixture: SaveFixture,
+        account: Account,
     ) -> None:
         organization = await create_organization(
             save_fixture,
+            account,
             feature_settings={
                 "seat_based_pricing_enabled": True,
                 "member_model_enabled": True,
@@ -691,6 +695,66 @@ class TestAssignSeat:
         assert seat.member.organization_id == organization.id
 
     @pytest.mark.asyncio
+    async def test_assign_seat_with_email_only_member_model_enabled_does_not_create_customer(
+        self,
+        session: AsyncSession,
+        save_fixture: SaveFixture,
+        account: Account,
+    ) -> None:
+        """Regression test: when member_model_enabled=True and only an email is
+        provided, no individual Customer should be created for the seat holder.
+        The seat holder is represented as a Member under the billing customer.
+        """
+        from polar.customer.repository import CustomerRepository
+
+        organization = await create_organization(
+            save_fixture,
+            account,
+            feature_settings={
+                "seat_based_pricing_enabled": True,
+                "member_model_enabled": True,
+            },
+        )
+        product = await create_product(
+            save_fixture,
+            organization=organization,
+            recurring_interval=SubscriptionRecurringInterval.month,
+            prices=[("seat", 1000, "usd")],
+        )
+        billing_customer = await create_customer(
+            save_fixture,
+            organization=organization,
+            email="billing@example.com",
+        )
+        subscription = await create_subscription_with_seats(
+            save_fixture, product=product, customer=billing_customer, seats=5
+        )
+
+        with patch("polar.customer_seat.service.send_seat_invitation_email"):
+            seat = await seat_service.assign_seat(
+                session, subscription, email="seat@example.com"
+            )
+
+        # Seat is linked to the billing customer via a Member — not a new
+        # individual Customer.
+        assert seat.customer_id == billing_customer.id
+        assert seat.email == "seat@example.com"
+        assert seat.member_id is not None
+
+        await session.refresh(seat, ["member"])
+        assert seat.member is not None
+        assert seat.member.customer_id == billing_customer.id
+        assert seat.member.email == "seat@example.com"
+
+        customer_repository = CustomerRepository.from_session(session)
+        assert (
+            await customer_repository.get_by_email_and_organization(
+                "seat@example.com", organization.id
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
     async def test_assign_seat_without_member_model_enabled(
         self,
         session: AsyncSession,
@@ -723,9 +787,11 @@ class TestAssignSeat:
         self,
         session: AsyncSession,
         save_fixture: SaveFixture,
+        account: Account,
     ) -> None:
         organization = await create_organization(
             save_fixture,
+            account,
             feature_settings={
                 "seat_based_pricing_enabled": True,
                 "member_model_enabled": True,
@@ -758,17 +824,21 @@ class TestAssignSeat:
         assert seat is not None
         assert seat.email == "seat@example.com"
         assert seat.member_id is not None
-        assert seat.customer_id == seat_customer.id
+        # When member_model_enabled=True, customer_id on the seat is the billing
+        # customer and the seat holder is represented as a Member.
+        assert seat.customer_id == billing_customer.id
 
     @pytest.mark.asyncio
     async def test_assign_seat_with_external_customer_id_backward_compat(
         self,
         session: AsyncSession,
         save_fixture: SaveFixture,
+        account: Account,
     ) -> None:
         """Test that assign_seat auto-resolves external_customer_id when member_model_enabled."""
         organization = await create_organization(
             save_fixture,
+            account,
             feature_settings={
                 "seat_based_pricing_enabled": True,
                 "member_model_enabled": True,
@@ -802,17 +872,21 @@ class TestAssignSeat:
         assert seat is not None
         assert seat.email == "ext-seat@example.com"
         assert seat.member_id is not None
-        assert seat.customer_id == seat_customer.id
+        # When member_model_enabled=True, customer_id on the seat is the billing
+        # customer and the seat holder is represented as a Member.
+        assert seat.customer_id == billing_customer.id
 
     @pytest.mark.asyncio
     async def test_assign_seat_customer_id_not_found_member_model(
         self,
         session: AsyncSession,
         save_fixture: SaveFixture,
+        account: Account,
     ) -> None:
         """Test that non-existent customer_id raises error even with backward compat."""
         organization = await create_organization(
             save_fixture,
+            account,
             feature_settings={
                 "seat_based_pricing_enabled": True,
                 "member_model_enabled": True,
@@ -833,7 +907,7 @@ class TestAssignSeat:
             save_fixture, product=product, customer=billing_customer, seats=5
         )
 
-        with pytest.raises(CustomerNotFound):
+        with pytest.raises(InvalidSeatAssignmentRequest):
             await seat_service.assign_seat(
                 session, subscription, customer_id=uuid.uuid4()
             )
@@ -843,10 +917,12 @@ class TestAssignSeat:
         self,
         session: AsyncSession,
         save_fixture: SaveFixture,
+        account: Account,
     ) -> None:
         """Test that assign_seat requires email when member_model_enabled is true."""
         organization = await create_organization(
             save_fixture,
+            account,
             feature_settings={
                 "seat_based_pricing_enabled": True,
                 "member_model_enabled": True,
@@ -876,6 +952,7 @@ class TestAssignSeat:
         self,
         session: AsyncSession,
         save_fixture: SaveFixture,
+        account: Account,
     ) -> None:
         """Test that seat assignment does not change customer type.
 
@@ -887,6 +964,7 @@ class TestAssignSeat:
 
         organization = await create_organization(
             save_fixture,
+            account,
             feature_settings={
                 "seat_based_pricing_enabled": True,
                 "member_model_enabled": True,
@@ -926,10 +1004,12 @@ class TestAssignSeat:
         self,
         session: AsyncSession,
         save_fixture: SaveFixture,
+        account: Account,
     ) -> None:
         """Test assigning a seat by external_member_id when member already exists."""
         organization = await create_organization(
             save_fixture,
+            account,
             feature_settings={
                 "seat_based_pricing_enabled": True,
                 "member_model_enabled": True,
@@ -973,10 +1053,12 @@ class TestAssignSeat:
         self,
         session: AsyncSession,
         save_fixture: SaveFixture,
+        account: Account,
     ) -> None:
         """Test that external_member_id alone returns 404 when member not found."""
         organization = await create_organization(
             save_fixture,
+            account,
             feature_settings={
                 "seat_based_pricing_enabled": True,
                 "member_model_enabled": True,
@@ -1007,10 +1089,12 @@ class TestAssignSeat:
         self,
         session: AsyncSession,
         save_fixture: SaveFixture,
+        account: Account,
     ) -> None:
         """Test that external_member_id + email creates a new member with both fields."""
         organization = await create_organization(
             save_fixture,
+            account,
             feature_settings={
                 "seat_based_pricing_enabled": True,
                 "member_model_enabled": True,
@@ -1054,6 +1138,7 @@ class TestAssignSeat:
         self,
         session: AsyncSession,
         save_fixture: SaveFixture,
+        account: Account,
     ) -> None:
         """When a member with the same email already exists (without external_id),
         assigning a seat with external_member_id should link the external_id to
@@ -1063,6 +1148,7 @@ class TestAssignSeat:
         members_customer_id_email_active_key."""
         organization = await create_organization(
             save_fixture,
+            account,
             feature_settings={
                 "seat_based_pricing_enabled": True,
                 "member_model_enabled": True,
@@ -1113,6 +1199,7 @@ class TestAssignSeat:
         self,
         session: AsyncSession,
         save_fixture: SaveFixture,
+        account: Account,
     ) -> None:
         """When a member exists with the same email but a different external_id,
         assigning a seat with a new external_member_id should raise
@@ -1121,6 +1208,7 @@ class TestAssignSeat:
         Regression test for SERVER-3XN."""
         organization = await create_organization(
             save_fixture,
+            account,
             feature_settings={
                 "seat_based_pricing_enabled": True,
                 "member_model_enabled": True,
@@ -1165,10 +1253,12 @@ class TestAssignSeat:
         self,
         session: AsyncSession,
         save_fixture: SaveFixture,
+        account: Account,
     ) -> None:
         """Test external_member_id + email when member exists and email matches."""
         organization = await create_organization(
             save_fixture,
+            account,
             feature_settings={
                 "seat_based_pricing_enabled": True,
                 "member_model_enabled": True,
@@ -1213,10 +1303,12 @@ class TestAssignSeat:
         self,
         session: AsyncSession,
         save_fixture: SaveFixture,
+        account: Account,
     ) -> None:
         """Test external_member_id + email when member exists but email doesn't match."""
         organization = await create_organization(
             save_fixture,
+            account,
             feature_settings={
                 "seat_based_pricing_enabled": True,
                 "member_model_enabled": True,
@@ -1259,10 +1351,12 @@ class TestAssignSeat:
         self,
         session: AsyncSession,
         save_fixture: SaveFixture,
+        account: Account,
     ) -> None:
         """Test assigning a seat by member_id."""
         organization = await create_organization(
             save_fixture,
+            account,
             feature_settings={
                 "seat_based_pricing_enabled": True,
                 "member_model_enabled": True,
@@ -1303,10 +1397,12 @@ class TestAssignSeat:
         self,
         session: AsyncSession,
         save_fixture: SaveFixture,
+        account: Account,
     ) -> None:
         """Test that member_id returns 404 when member not found."""
         organization = await create_organization(
             save_fixture,
+            account,
             feature_settings={
                 "seat_based_pricing_enabled": True,
                 "member_model_enabled": True,
@@ -1338,10 +1434,12 @@ class TestAssignSeat:
         self,
         session: AsyncSession,
         save_fixture: SaveFixture,
+        account: Account,
     ) -> None:
         """Test that member_id from a different customer returns 404."""
         organization = await create_organization(
             save_fixture,
+            account,
             feature_settings={
                 "seat_based_pricing_enabled": True,
                 "member_model_enabled": True,
@@ -1383,10 +1481,12 @@ class TestAssignSeat:
         self,
         session: AsyncSession,
         save_fixture: SaveFixture,
+        account: Account,
     ) -> None:
         """Test that assigning by external_member_id raises SeatAlreadyAssigned if duplicate."""
         organization = await create_organization(
             save_fixture,
+            account,
             feature_settings={
                 "seat_based_pricing_enabled": True,
                 "member_model_enabled": True,
@@ -1477,10 +1577,12 @@ class TestAssignSeat:
         self,
         session: AsyncSession,
         save_fixture: SaveFixture,
+        account: Account,
     ) -> None:
         """Test assigning a seat by member_id with immediate_claim."""
         organization = await create_organization(
             save_fixture,
+            account,
             feature_settings={
                 "seat_based_pricing_enabled": True,
                 "member_model_enabled": True,
@@ -1740,9 +1842,11 @@ class TestClaimSeat:
         self,
         session: AsyncSession,
         save_fixture: SaveFixture,
+        account: Account,
     ) -> None:
         organization = await create_organization(
             save_fixture,
+            account,
             feature_settings={
                 "seat_based_pricing_enabled": True,
                 "member_model_enabled": True,
@@ -1846,10 +1950,12 @@ class TestRevokeSeat:
         self,
         session: AsyncSession,
         save_fixture: SaveFixture,
+        account: Account,
     ) -> None:
         """Test that revoke_seat clears member_id, email and customer_id when member_model_enabled."""
         organization = await create_organization(
             save_fixture,
+            account,
             feature_settings={
                 "seat_based_pricing_enabled": True,
                 "member_model_enabled": True,
@@ -1954,13 +2060,18 @@ class TestGetSeat:
         save_fixture: SaveFixture,
         product: Product,
         customer: Customer,
+        user: User,
     ) -> None:
         # Create a different organization (not seat-enabled)
-        different_org = await create_organization(save_fixture)
+        different_org = await create_organization(
+            save_fixture, await create_account(save_fixture, user)
+        )
         auth_subject = AuthSubject(subject=different_org, scopes=set(), session=None)
 
         # Create a seat with seat-enabled organization
-        seat_enabled_org = await create_organization(save_fixture)
+        seat_enabled_org = await create_organization(
+            save_fixture, await create_account(save_fixture, user)
+        )
         seat_enabled_org.feature_settings = {"seat_based_pricing_enabled": True}
         await save_fixture(seat_enabled_org)
 
@@ -2180,10 +2291,12 @@ class TestResendInvitation:
         self,
         session: AsyncSession,
         save_fixture: SaveFixture,
+        account: Account,
     ) -> None:
         """Test that resend_invitation uses seat.email when member_model_enabled."""
         organization = await create_organization(
             save_fixture,
+            account,
             feature_settings={
                 "seat_based_pricing_enabled": True,
                 "member_model_enabled": True,
@@ -2553,6 +2666,7 @@ class TestAssignSeatToDeletedMember:
         self,
         session: AsyncSession,
         save_fixture: SaveFixture,
+        account: Account,
     ) -> None:
         """
         Test that assigning a seat to an email that belongs to a soft-deleted member
@@ -2572,6 +2686,7 @@ class TestAssignSeatToDeletedMember:
         # Setup organization with member_model_enabled
         organization = await create_organization(
             save_fixture,
+            account,
             feature_settings={
                 "seat_based_pricing_enabled": True,
                 "member_model_enabled": True,

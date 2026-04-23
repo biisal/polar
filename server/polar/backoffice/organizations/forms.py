@@ -69,12 +69,22 @@ class DenyOrganizationAppealForm(forms.BaseForm):
     ]
 
 
+class OffboardOrganizationForm(forms.BaseForm):
+    action: Annotated[Literal["offboard"], forms.SkipField]
+    reason: Annotated[
+        str | None,
+        forms.TextAreaField(rows=3, placeholder="Reason for offboarding"),
+        Field(default=None, title="Reason"),
+    ]
+
+
 OrganizationStatusForm = Annotated[
     ApproveOrganizationForm
     | DenyOrganizationForm
     | UnderReviewOrganizationForm
     | ApproveOrganizationAppealForm
-    | DenyOrganizationAppealForm,
+    | DenyOrganizationAppealForm
+    | OffboardOrganizationForm,
     Discriminator("action"),
 ]
 

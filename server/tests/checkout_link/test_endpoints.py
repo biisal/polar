@@ -1,3 +1,5 @@
+import uuid
+
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient
@@ -6,12 +8,13 @@ from polar.auth.scope import Scope
 from polar.checkout.repository import CheckoutRepository
 from polar.checkout.service import CHECKOUT_CLIENT_SECRET_PREFIX
 from polar.enums import SubscriptionRecurringInterval
-from polar.kit.utils import utc_now
-from polar.models import Checkout, CheckoutLink, Product, UserOrganization
+from polar.models import Checkout, CheckoutLink, Product, User, UserOrganization
+from polar.models.organization import OrganizationStatus
 from polar.postgres import AsyncSession
 from tests.fixtures.auth import AuthSubjectFixture
 from tests.fixtures.database import SaveFixture
 from tests.fixtures.random_objects import (
+    create_account,
     create_checkout_link,
     create_organization,
     create_product,
@@ -26,6 +29,47 @@ async def checkout_link(save_fixture: SaveFixture, product: Product) -> Checkout
         success_url="https://example.com/success",
         user_metadata={"key": "value"},
     )
+
+
+@pytest_asyncio.fixture
+async def checkout_link_organization_second(
+    save_fixture: SaveFixture,
+    product_organization_second: Product,
+) -> CheckoutLink:
+    return await create_checkout_link(
+        save_fixture,
+        products=[product_organization_second],
+        success_url="https://example.com/success",
+    )
+
+
+@pytest.mark.asyncio
+class TestListCheckoutLinks:
+    async def test_anonymous(self, client: AsyncClient) -> None:
+        response = await client.get("/v1/checkout-links/")
+
+        assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+class TestGetCheckoutLink:
+    async def test_anonymous(self, client: AsyncClient) -> None:
+        response = await client.get(f"/v1/checkout-links/{uuid.uuid4()}")
+
+        assert response.status_code == 401
+
+    @pytest.mark.auth
+    async def test_user_cannot_access_other_organization_checkout_link(
+        self,
+        client: AsyncClient,
+        user_organization: UserOrganization,
+        checkout_link_organization_second: CheckoutLink,
+    ) -> None:
+        response = await client.get(
+            f"/v1/checkout-links/{checkout_link_organization_second.id}"
+        )
+
+        assert response.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -205,14 +249,14 @@ class TestRedirect:
         assert response.status_code == 404
 
     async def test_blocked_organization(
-        self,
-        save_fixture: SaveFixture,
-        client: AsyncClient,
+        self, save_fixture: SaveFixture, client: AsyncClient, user: User
     ) -> None:
+        account = await create_account(save_fixture, user)
         org = await create_organization(
             save_fixture,
+            account,
             name_prefix="blockedorg",
-            blocked_at=utc_now(),
+            status=OrganizationStatus.BLOCKED,
         )
         product = await create_product(
             save_fixture,

@@ -1,11 +1,9 @@
 # pyright: reportCallIssue=false
 import asyncio
 import contextlib
-import dataclasses
 import random
 import uuid
-from collections.abc import AsyncIterator, Coroutine
-from typing import Any
+from collections.abc import AsyncIterator, Awaitable, Callable
 
 import httpx
 import pycountry
@@ -31,9 +29,6 @@ from plain_client import (
     CustomerIdentifierInput,
     EmailAddressInput,
     Plain,
-    ReplyToThreadInput,
-    SnoozeStatusDetail,
-    SnoozeThreadInput,
     ThreadsFilter,
     ThreadStatus,
     UpsertCustomerIdentifierInput,
@@ -46,24 +41,21 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import contains_eager
 
 from polar.config import settings
-from polar.email.repository import EmailLogRepository
-from polar.email.sender import DEFAULT_FROM_EMAIL_ADDRESS, DEFAULT_FROM_NAME
-from polar.enums import EmailSender
+from polar.customer.repository import CustomerRepository
 from polar.exceptions import PolarError
 from polar.kit.currency import format_currency
+from polar.kit.db.postgres import AsyncReadSessionMaker
 from polar.models import (
     Customer,
     OAuthAccount,
     Order,
     Organization,
-    Product,
     User,
     UserOrganization,
 )
-from polar.models.email_log import EmailLogStatus
-from polar.models.organization import OrganizationStatus
 from polar.models.organization_review import OrganizationReview
-from polar.postgres import AsyncSession
+from polar.order.repository import OrderRepository
+from polar.postgres import AsyncReadSession, AsyncSession
 from polar.user.repository import UserRepository
 
 from .schemas import (
@@ -80,22 +72,14 @@ SUPPORT_AGENT_IDS: list[str] = [
     "u_01K0RC6SY9Q8KSVNAYGD7EY6M5",  # Rishi
 ]
 
+PLAIN_WORKSPACE_ID = "w_01JE9TRRX9KT61D8P2CH77XDQM"
 
-@dataclasses.dataclass
-class OrgIssues:
-    missing_website: bool = False
-    missing_socials: bool = False
-    admin_not_verified: bool = False
-    admin_verification_status: str = ""
+
+def plain_thread_url(thread_id: str) -> str:
+    return f"https://app.plain.com/workspace/{PLAIN_WORKSPACE_ID}/thread/{thread_id}"
 
 
 class PlainServiceError(PolarError): ...
-
-
-class AccountAdminDoesNotExistError(PlainServiceError):
-    def __init__(self, account_id: uuid.UUID) -> None:
-        self.account_id = account_id
-        super().__init__(f"Account admin does not exist for account ID {account_id}")
 
 
 class AccountReviewThreadCreationError(PlainServiceError):
@@ -122,181 +106,50 @@ class PlainCustomerError(PlainServiceError):
 
 _card_getter_semaphore = asyncio.Semaphore(3)
 
+CardGetter = Callable[
+    [AsyncReadSession, CustomerCardsRequest], Awaitable[CustomerCard | None]
+]
+
 
 async def _card_getter_task(
-    coroutine: Coroutine[Any, Any, CustomerCard | None],
+    sessionmaker: AsyncReadSessionMaker,
+    getter: CardGetter,
+    request: CustomerCardsRequest,
 ) -> CustomerCard | None:
     async with _card_getter_semaphore:
-        return await coroutine
+        async with sessionmaker() as session:
+            return await getter(session, request)
 
 
 class PlainService:
     enabled = settings.PLAIN_TOKEN is not None
 
     async def get_cards(
-        self, session: AsyncSession, request: CustomerCardsRequest
+        self,
+        sessionmaker: AsyncReadSessionMaker,
+        request: CustomerCardsRequest,
     ) -> CustomerCardsResponse:
+        getters: list[CardGetter] = []
+        if CustomerCardKey.user in request.cardKeys:
+            getters.append(self._get_user_card)
+        if CustomerCardKey.organization in request.cardKeys:
+            getters.append(self._get_organization_card)
+        if CustomerCardKey.customer in request.cardKeys:
+            getters.append(self.get_customer_card)
+        if CustomerCardKey.order in request.cardKeys:
+            getters.append(self._get_order_card)
+        if CustomerCardKey.snippets in request.cardKeys:
+            getters.append(self._get_snippets_card)
+
         tasks: list[asyncio.Task[CustomerCard | None]] = []
         async with asyncio.TaskGroup() as tg:
-            if CustomerCardKey.user in request.cardKeys:
+            for getter in getters:
                 tasks.append(
-                    tg.create_task(
-                        _card_getter_task(self._get_user_card(session, request))
-                    )
-                )
-            if CustomerCardKey.organization in request.cardKeys:
-                tasks.append(
-                    tg.create_task(
-                        _card_getter_task(self._get_organization_card(session, request))
-                    )
-                )
-            if CustomerCardKey.customer in request.cardKeys:
-                tasks.append(
-                    tg.create_task(
-                        _card_getter_task(self.get_customer_card(session, request))
-                    )
-                )
-            if CustomerCardKey.order in request.cardKeys:
-                tasks.append(
-                    tg.create_task(
-                        _card_getter_task(self._get_order_card(session, request))
-                    )
-                )
-            if CustomerCardKey.snippets in request.cardKeys:
-                tasks.append(
-                    tg.create_task(
-                        _card_getter_task(self._get_snippets_card(session, request))
-                    )
+                    tg.create_task(_card_getter_task(sessionmaker, getter, request))
                 )
 
         cards = [card for task in tasks if (card := task.result()) is not None]
         return CustomerCardsResponse(cards=cards)
-
-    async def create_organization_review_thread(
-        self, session: AsyncSession, organization: Organization
-    ) -> None:
-        if not self.enabled:
-            return
-
-        user_repository = UserRepository.from_session(session)
-        if organization.account is None:
-            from polar.organization.tasks import OrganizationAccountNotSet
-
-            raise OrganizationAccountNotSet(organization.id)
-        admin = await user_repository.get_by_id(organization.account.admin_id)
-        if admin is None:
-            raise AccountAdminDoesNotExistError(organization.account.admin_id)
-
-        async with self._get_plain_client() as plain:
-            try:
-                customer_identifier = await self._get_or_create_customer(plain, admin)
-            except PlainCustomerError as e:
-                raise AccountReviewThreadCreationError(
-                    organization.account.id, e.message
-                ) from e
-
-            match organization.status:
-                case OrganizationStatus.INITIAL_REVIEW:
-                    title = "Initial Account Review"
-                case OrganizationStatus.ONGOING_REVIEW:
-                    title = "Ongoing Account Review"
-                case _:
-                    raise ValueError("Organization is not under review")
-
-            should_send_email = organization.status == OrganizationStatus.INITIAL_REVIEW
-            assigned_to = CreateThreadAssignedToInput(
-                user_id=random.choice(SUPPORT_AGENT_IDS)
-            )
-
-            thread_result = await plain.create_thread(
-                CreateThreadInput(
-                    customer_identifier=customer_identifier,
-                    title=title,
-                    label_type_ids=["lt_01JFG7F4N67FN3MAWK06FJ8FPG"],
-                    assigned_to=assigned_to,
-                    components=[
-                        ComponentInput(
-                            component_text=ComponentTextInput(
-                                text=f"The organization `{organization.slug}` should be reviewed, as it hit a threshold."
-                            )
-                        ),
-                        ComponentInput(
-                            component_spacer=ComponentSpacerInput(
-                                spacer_size=ComponentSpacerSize.M
-                            )
-                        ),
-                        ComponentInput(
-                            component_link_button=ComponentLinkButtonInput(
-                                link_button_url=settings.generate_backoffice_url(
-                                    f"/organizations/{organization.id}"
-                                ),
-                                link_button_label="Review organization ↗",
-                            )
-                        ),
-                    ],
-                )
-            )
-            if thread_result.error is not None:
-                raise AccountReviewThreadCreationError(
-                    organization.account.id, thread_result.error.message
-                )
-
-            # For initial reviews, send the review action checklist as an outbound reply
-            if should_send_email and thread_result.thread is not None:
-                issues = self._check_org_issues(organization, admin)
-                message = self._build_review_message(
-                    organization.name or organization.slug, issues
-                )
-                reply_result = await plain.reply_to_thread(
-                    ReplyToThreadInput(
-                        thread_id=thread_result.thread.id,
-                        text_content=message,
-                        markdown_content=message,
-                    )
-                )
-                if reply_result.error is not None:
-                    log.error(
-                        "Failed to post review action message",
-                        thread_id=thread_result.thread.id,
-                        slug=organization.slug,
-                        error=reply_result.error.message,
-                    )
-
-                email_log_repository = EmailLogRepository.from_session(session)
-                await email_log_repository.create_log(
-                    status=EmailLogStatus.failed
-                    if reply_result.error
-                    else EmailLogStatus.sent,
-                    processor=EmailSender.plain,
-                    processor_id=thread_result.thread.id,
-                    to_email_addr=admin.email,
-                    from_email_addr=DEFAULT_FROM_EMAIL_ADDRESS,
-                    from_name=DEFAULT_FROM_NAME,
-                    subject=title,
-                    email_template="_build_review_message",
-                    error=reply_result.error.message if reply_result.error else None,
-                )
-
-                # Snooze the thread if we asked the customer for more details
-                has_action_items = (
-                    issues.missing_website
-                    or issues.missing_socials
-                    or issues.admin_not_verified
-                )
-                if has_action_items:
-                    snooze_result = await plain.snooze_thread(
-                        SnoozeThreadInput(
-                            thread_id=thread_result.thread.id,
-                            status_detail=SnoozeStatusDetail.WAITING_FOR_CUSTOMER,
-                        )
-                    )
-                    if snooze_result.error is not None:
-                        log.error(
-                            "Failed to snooze thread",
-                            thread_id=thread_result.thread.id,
-                            slug=organization.slug,
-                            error=snooze_result.error.message,
-                        )
 
     async def create_appeal_review_thread(
         self,
@@ -426,7 +279,6 @@ class PlainService:
                 CreateThreadInput(
                     customer_identifier=customer_identifier,
                     title=f"Organization Deletion Request - {organization.slug}",
-                    label_type_ids=["lt_01JKD9ASBPVX09YYXGHSXZRWSA"],
                     components=[
                         ComponentInput(
                             component_text=ComponentTextInput(
@@ -505,7 +357,7 @@ class PlainService:
                 )
 
     async def _get_user_card(
-        self, session: AsyncSession, request: CustomerCardsRequest
+        self, session: AsyncReadSession, request: CustomerCardsRequest
     ) -> CustomerCard | None:
         email = request.customer.email
 
@@ -638,7 +490,7 @@ class PlainService:
         )
 
     async def _get_organization_card(
-        self, session: AsyncSession, request: CustomerCardsRequest
+        self, session: AsyncReadSession, request: CustomerCardsRequest
     ) -> CustomerCard | None:
         email = request.customer.email
 
@@ -837,7 +689,7 @@ class PlainService:
         )
 
     async def get_customer_card(
-        self, session: AsyncSession, request: CustomerCardsRequest
+        self, session: AsyncReadSession, request: CustomerCardsRequest
     ) -> CustomerCard | None:
         email = request.customer.email
 
@@ -1004,26 +856,24 @@ class PlainService:
         )
 
     async def _get_order_card(
-        self, session: AsyncSession, request: CustomerCardsRequest
+        self, session: AsyncReadSession, request: CustomerCardsRequest
     ) -> CustomerCard | None:
         email = request.customer.email
 
-        statement = (
-            (
-                select(Order)
-                .join(Customer, onclause=Customer.id == Order.customer_id)
-                .join(Product, onclause=Product.id == Order.product_id, isouter=True)
-                .where(func.lower(Customer.email) == email.lower())
-            )
-            .order_by(Order.created_at.desc())
-            .limit(3)
-            .options(
+        customer_repository = CustomerRepository.from_session(session)
+        customer_ids = await customer_repository.get_ids_by_email(email)
+        if not customer_ids:
+            return None
+
+        order_repository = OrderRepository.from_session(session)
+        orders = await order_repository.get_latest_by_customer_ids(
+            customer_ids,
+            limit=3,
+            options=(
                 contains_eager(Order.product),
                 contains_eager(Order.customer).joinedload(Customer.organization),
-            )
+            ),
         )
-        result = await session.execute(statement)
-        orders = result.unique().scalars().all()
 
         if len(orders) == 0:
             return None
@@ -1278,7 +1128,7 @@ class PlainService:
         )
 
     async def _get_snippets_card(
-        self, session: AsyncSession, request: CustomerCardsRequest
+        self, session: AsyncReadSession, request: CustomerCardsRequest
     ) -> CustomerCard | None:
         email = request.customer.email
 
@@ -1526,88 +1376,6 @@ class PlainService:
                     nr_threads += 1
             log.info(f"There are {nr_threads} threads for user {customer_email}")
             return nr_threads > 0
-
-    def _check_org_issues(
-        self,
-        organization: Organization,
-        admin: User,
-    ) -> OrgIssues:
-        """Check an organization for actionable issues."""
-        issues = OrgIssues()
-
-        if not organization.website:
-            issues.missing_website = True
-
-        if not organization.socials:
-            issues.missing_socials = True
-
-        if not admin.identity_verified:
-            issues.admin_not_verified = True
-            issues.admin_verification_status = admin.identity_verification_status
-
-        return issues
-
-    def _build_review_message(self, organization_name: str, issues: OrgIssues) -> str:
-        """Build a friendly numbered message adapted to the org's specific issues."""
-        lines: list[str] = [
-            f"Welcome to Polar! Your organization {organization_name} is currently being reviewed. "
-            "This is a standard step all new organizations go through so we can verify account details and ensure compliance with our policies.",
-            "",
-            "Reviews typically take up to 3 business days (occasionally up to 7). "
-            "You can keep using Polar in the mean time to set up your products and integration.",
-            "",
-        ]
-
-        has_action_items = (
-            issues.missing_website
-            or issues.missing_socials
-            or issues.admin_not_verified
-        )
-
-        if has_action_items:
-            item_num = 1
-
-            if issues.missing_website:
-                lines.append(
-                    f"{item_num}. Please add your product's URL under Settings → General → Website."
-                )
-                item_num += 1
-
-            if issues.missing_socials:
-                lines.append(
-                    f"{item_num}. Please add your personal social links (not your product's) under Settings → General → Social links. "
-                    "These are never displayed publicly. We only use them to verify your identity to avoid people impersonating businesses they do not own."
-                )
-                item_num += 1
-
-            if issues.admin_not_verified:
-                lines.append(
-                    f"{item_num}. Verify your identity under Finance → Payout account. "
-                    "You'll need an ID document (driver's license, ID, passport, ...) and your phone. "
-                    "It's fully secure and only takes a few minutes."
-                )
-
-            lines.append("")
-
-        if has_action_items:
-            lines.append(
-                "Once you've completed these steps, please reply to this email and we'll finalize your review."
-            )
-        else:
-            lines.append(
-                "We'll let you know as soon as you're all set, or if we need anything from you."
-            )
-        lines.append("")
-        lines.append("You can learn more about our review process on our website:")
-        lines.append("https://polar.sh/docs/merchant-of-record/account-reviews")
-        lines.append("")
-        lines.append("Any other questions? Just reply to this message.")
-        lines.append("")
-        lines.append("Cheers,")
-        lines.append("")
-        lines.append("The customer success team at Polar")
-
-        return "\n".join(lines)
 
     @contextlib.asynccontextmanager
     async def _get_plain_client(self) -> AsyncIterator[Plain]:

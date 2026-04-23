@@ -11,7 +11,6 @@ from sqlalchemy.orm import Session
 from polar.kit.utils import utc_now
 from polar.logging import Logger
 from polar.models import Customer, Organization, Subscription
-from polar.models.organization import OrganizationStatus
 from polar.postgres import create_sync_engine
 
 log: Logger = structlog.get_logger()
@@ -61,14 +60,19 @@ class SubscriptionJobStore(BaseJobStore):
         return jobs
 
     def remove_job(self, job_id: str) -> None:
+        # Conditional UPDATE dedupes concurrent schedulers: losers see 0 rows.
         subscription_id = job_id.split(":")[-1]
         statement = (
             update(Subscription)
-            .where(Subscription.id == subscription_id)
+            .where(
+                Subscription.id == subscription_id,
+                Subscription.scheduler_locked_at.is_(None),
+            )
             .values(scheduler_locked_at=utc_now())
         )
         with self.engine.begin() as connection:
-            connection.execute(statement)
+            if connection.execute(statement).rowcount == 0:
+                return
         actor = dramatiq.get_broker().get_actor("subscription.cycle")
         actor.send(subscription_id=subscription_id)
 
@@ -106,8 +110,7 @@ class SubscriptionJobStore(BaseJobStore):
                     "next_run_time": trigger.run_date,
                     "misfire_grace_time": None,
                 }
-                job = Job(self._scheduler, **job_kwargs)
-                jobs.append(job)
+                jobs.append(Job(self._scheduler, **job_kwargs))
         return jobs
 
     @staticmethod
@@ -125,8 +128,7 @@ class SubscriptionJobStore(BaseJobStore):
             .where(
                 Customer.is_deleted.is_(False),
                 Organization.is_deleted.is_(False),
-                Organization.blocked_at.is_(None),
-                Organization.status != OrganizationStatus.DENIED,
+                Organization.can_renew_subscriptions.is_(True),
                 Subscription.scheduler_locked_at.is_(None),
                 Subscription.active.is_(True),
                 Subscription.current_period_end.is_not(None),

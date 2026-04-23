@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal
@@ -46,7 +47,24 @@ OrganizationID = Annotated[
     Field(examples=[ORGANIZATION_ID_EXAMPLE]),
 ]
 
-NameInput = Annotated[str, StringConstraints(min_length=3)]
+
+def validate_blocked_words(value: str) -> str:
+    pattern = re.compile(
+        r"\b("
+        + "|".join(re.escape(w) for w in settings.ORGANIZATION_BLOCKED_WORDS)
+        + r")\b",
+        re.IGNORECASE,
+    )
+    if pattern.search(value):
+        raise ValueError("This name is not allowed.")
+    return value
+
+
+NameInput = Annotated[
+    str,
+    StringConstraints(min_length=3),
+    AfterValidator(validate_blocked_words),
+]
 
 
 def validate_reserved_keywords(value: str) -> str:
@@ -60,6 +78,7 @@ SlugInput = Annotated[
     StringConstraints(to_lower=True, min_length=3),
     SlugValidator,
     AfterValidator(validate_reserved_keywords),
+    AfterValidator(validate_blocked_words),
 ]
 
 
@@ -78,9 +97,6 @@ class OrganizationFeatureSettings(Schema):
     )
     seat_based_pricing_enabled: bool = Field(
         False, description="If this organization has seat-based pricing enabled"
-    )
-    revops_enabled: bool = Field(
-        False, description="If this organization has RevOps enabled"
     )
     wallets_enabled: bool = Field(
         False, description="If this organization has Wallets enabled"
@@ -274,7 +290,6 @@ class LegacyOrganizationStatus(StrEnum):
     """
 
     CREATED = "created"
-    ONBOARDING_STARTED = "onboarding_started"
     UNDER_REVIEW = "under_review"
     DENIED = "denied"
     ACTIVE = "active"
@@ -283,13 +298,12 @@ class LegacyOrganizationStatus(StrEnum):
     def from_status(cls, status: OrganizationStatus) -> "LegacyOrganizationStatus":
         mapping = {
             OrganizationStatus.CREATED: LegacyOrganizationStatus.CREATED,
-            OrganizationStatus.ONBOARDING_STARTED: (
-                LegacyOrganizationStatus.ONBOARDING_STARTED
-            ),
-            OrganizationStatus.INITIAL_REVIEW: LegacyOrganizationStatus.UNDER_REVIEW,
-            OrganizationStatus.ONGOING_REVIEW: LegacyOrganizationStatus.UNDER_REVIEW,
+            OrganizationStatus.REVIEW: LegacyOrganizationStatus.UNDER_REVIEW,
+            OrganizationStatus.SNOOZED: LegacyOrganizationStatus.UNDER_REVIEW,
             OrganizationStatus.DENIED: LegacyOrganizationStatus.DENIED,
             OrganizationStatus.ACTIVE: LegacyOrganizationStatus.ACTIVE,
+            OrganizationStatus.BLOCKED: LegacyOrganizationStatus.DENIED,
+            OrganizationStatus.OFFBOARDING: LegacyOrganizationStatus.ACTIVE,
         }
         try:
             return mapping[status]
@@ -527,4 +541,10 @@ class OrganizationValidateWebsiteResponse(Schema):
     )
     error: str | None = Field(
         default=None, description="Error message if the URL is not reachable."
+    )
+
+
+class OrganizationPayoutAccountSet(Schema):
+    payout_account_id: UUID4 = Field(
+        description="ID of the payout account to set on the organization."
     )

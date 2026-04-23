@@ -7,6 +7,7 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.orm import joinedload
 
 from polar.auth.models import AuthSubject, Customer, Member
+from polar.authz.service import get_accessible_org_ids
 from polar.benefit.strategies.license_keys.properties import (
     BenefitLicenseKeysProperties,
 )
@@ -20,6 +21,7 @@ from polar.models import (
     Organization,
     User,
 )
+from polar.models.license_key import LicenseKeyStatus
 from polar.postgres import AsyncReadSession, AsyncSession
 
 from .repository import LicenseKeyRepository
@@ -43,10 +45,12 @@ class LicenseKeyService:
         pagination: PaginationParams,
         organization_id: Sequence[UUID] | None = None,
         benefit_id: Sequence[UUID] | None = None,
+        status: Sequence[LicenseKeyStatus] | None = None,
     ) -> tuple[Sequence[LicenseKey], int]:
         repository = LicenseKeyRepository.from_session(session)
+        org_ids = await get_accessible_org_ids(session, auth_subject)
         statement = (
-            repository.get_readable_statement(auth_subject)
+            repository.get_statement_by_org_ids(org_ids)
             .order_by(LicenseKey.created_at.asc())
             .options(*repository.get_eager_options())
         )
@@ -56,6 +60,9 @@ class LicenseKeyService:
 
         if benefit_id is not None:
             statement = statement.where(LicenseKey.benefit_id.in_(benefit_id))
+
+        if status is not None:
+            statement = statement.where(LicenseKey.status.in_(status))
 
         return await repository.paginate(
             statement, limit=pagination.limit, page=pagination.page
@@ -68,8 +75,9 @@ class LicenseKeyService:
         id: UUID,
     ) -> LicenseKey | None:
         repository = LicenseKeyRepository.from_session(session)
+        org_ids = await get_accessible_org_ids(session, auth_subject)
         statement = (
-            repository.get_readable_statement(auth_subject)
+            repository.get_statement_by_org_ids(org_ids)
             .where(LicenseKey.id == id)
             .options(*repository.get_eager_options())
         )

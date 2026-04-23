@@ -323,7 +323,7 @@ def register(app: typer.Typer, prompt_setup: callable) -> None:
     def docker_logs(
         ctx: typer.Context,
         follow: Annotated[
-            bool, typer.Option("--follow", "-f", help="Follow log output")
+            bool, typer.Option("--follow", help="Follow log output")
         ] = True,
         service: Annotated[
             str | None, typer.Argument(help="Service to show logs for")
@@ -418,7 +418,7 @@ def register(app: typer.Typer, prompt_setup: callable) -> None:
     def docker_cleanup(
         ctx: typer.Context,
         force: Annotated[
-            bool, typer.Option("--force", "-f", help="Skip confirmation")
+            bool, typer.Option("--force", help="Skip confirmation")
         ] = False,
     ) -> None:
         """Stop services and remove all volumes (fresh start)."""

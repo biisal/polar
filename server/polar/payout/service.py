@@ -8,6 +8,7 @@ import stripe as stripe_lib
 import structlog
 
 from polar.auth.models import AuthSubject, User
+from polar.authz.service import get_accessible_org_ids
 from polar.config import settings
 from polar.enums import PayoutAccountType
 from polar.eventstream.service import publish as eventstream_publish
@@ -23,7 +24,6 @@ from polar.kit.sorting import Sorting
 from polar.locker import Locker
 from polar.logging import Logger
 from polar.models import Account, Organization, Payout, PayoutAttempt
-from polar.models.organization import OrganizationStatus
 from polar.models.payout import PayoutStatus
 from polar.models.payout_attempt import PayoutAttemptStatus
 from polar.organization.repository import OrganizationRepository
@@ -179,6 +179,13 @@ class PayoutAlreadyTriggered(PayoutError):
         super().__init__(message)
 
 
+class PayoutCanceled(PayoutError):
+    def __init__(self, payout: Payout) -> None:
+        self.payout = payout
+        message = f"Payout {payout.id} has been canceled and cannot be retried."
+        super().__init__(message, 400)
+
+
 class PayoutNotCancelable(PayoutError):
     def __init__(self, payout: Payout) -> None:
         self.payout = payout
@@ -211,7 +218,8 @@ class PayoutService:
         ],
     ) -> tuple[Sequence[Payout], int]:
         repository = PayoutRepository.from_session(session)
-        statement = repository.get_readable_statement(auth_subject).options(
+        org_ids = await get_accessible_org_ids(session, auth_subject)
+        statement = repository.get_statement_by_org_ids(org_ids).options(
             *repository.get_eager_options()
         )
 
@@ -234,8 +242,9 @@ class PayoutService:
         id: uuid.UUID,
     ) -> Payout | None:
         repository = PayoutRepository.from_session(session)
+        org_ids = await get_accessible_org_ids(session, auth_subject)
         statement = (
-            repository.get_readable_statement(auth_subject)
+            repository.get_statement_by_org_ids(org_ids)
             .where(Payout.id == id)
             .options(*repository.get_eager_options())
         )
@@ -244,11 +253,10 @@ class PayoutService:
     async def estimate(
         self, session: AsyncSession, organization: Organization
     ) -> PayoutEstimate:
-        if organization.status not in OrganizationStatus.payout_ready_statuses():
+        if not organization.can_payout:
             raise OrganizationUnderReview(organization)
 
         account = organization.account
-        assert account is not None
         payout_account = organization.get_ready_payout_account()
 
         balance_amount = await transaction_service.get_transactions_sum(
@@ -283,11 +291,10 @@ class PayoutService:
     async def create(
         self, session: AsyncSession, locker: Locker, organization: Organization
     ) -> Payout:
-        if organization.status not in OrganizationStatus.payout_ready_statuses():
+        if not organization.can_payout:
             raise OrganizationUnderReview(organization)
 
         account = organization.account
-        assert account is not None
 
         lock_name = f"payout:{account.id}"
         if await locker.is_locked(lock_name):
@@ -520,6 +527,9 @@ class PayoutService:
         This is useful for cases where Stripe refuses to pay out the full amount,
         because it's too large for the given currency.
         """
+        if payout.status == PayoutStatus.canceled:
+            raise PayoutCanceled(payout)
+
         payout_account = payout.payout_account
         assert payout_account.stripe_id is not None
 

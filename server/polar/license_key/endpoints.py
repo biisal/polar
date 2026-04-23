@@ -1,12 +1,14 @@
 from fastapi import Depends, Query
 from pydantic import UUID4
 
+from polar.authz.service import get_accessible_org_ids
 from polar.benefit.schemas import BenefitID
 from polar.exceptions import ResourceNotFound
 from polar.kit.db.postgres import AsyncReadSession, AsyncSession
 from polar.kit.pagination import ListResource, PaginationParamsQuery
 from polar.kit.schemas import MultipleQueryFilter
 from polar.models import LicenseKey, LicenseKeyActivation
+from polar.models.license_key import LicenseKeyStatus
 from polar.openapi import APITag
 from polar.organization.schemas import OrganizationID
 from polar.postgres import get_db_read_session, get_db_session
@@ -50,6 +52,11 @@ async def list(
     benefit_id: MultipleQueryFilter[BenefitID] | None = Query(
         None, title="BenefitID Filter", description="Filter by benefit ID."
     ),
+    status: MultipleQueryFilter[LicenseKeyStatus] | None = Query(
+        None,
+        title="LicenseKeyStatus Filter",
+        description="Filter by license key status.",
+    ),
     session: AsyncReadSession = Depends(get_db_read_session),
 ) -> ListResource[LicenseKeyRead]:
     """Get license keys connected to the given organization & filters."""
@@ -58,6 +65,7 @@ async def list(
         auth_subject,
         organization_id=organization_id,
         benefit_id=benefit_id,
+        status=status,
         pagination=pagination,
     )
 
@@ -157,10 +165,11 @@ async def validate(
 ) -> LicenseKey:
     """Validate a license key."""
     repository = LicenseKeyRepository.from_session(session)
+    org_ids = await get_accessible_org_ids(session, auth_subject)
     license_key = await repository.get_readable_by_key(
         validate.key,
         validate.organization_id,
-        auth_subject,
+        org_ids,
         options=repository.get_eager_options(),
     )
 
@@ -188,10 +197,11 @@ async def activate(
 ) -> LicenseKeyActivation:
     """Activate a license key instance."""
     repository = LicenseKeyRepository.from_session(session)
+    org_ids = await get_accessible_org_ids(session, auth_subject)
     license_key = await repository.get_readable_by_key(
         activate.key,
         activate.organization_id,
-        auth_subject,
+        org_ids,
         options=repository.get_eager_options(),
     )
 
@@ -219,10 +229,11 @@ async def deactivate(
 ) -> None:
     """Deactivate a license key instance."""
     repository = LicenseKeyRepository.from_session(session)
+    org_ids = await get_accessible_org_ids(session, auth_subject)
     license_key = await repository.get_readable_by_key(
         deactivate.key,
         deactivate.organization_id,
-        auth_subject,
+        org_ids,
         options=repository.get_eager_options(),
     )
 

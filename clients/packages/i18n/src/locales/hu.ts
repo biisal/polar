@@ -88,6 +88,21 @@ export default {
           _mode: 'plural',
         },
       },
+      perSeat: 'felhasználónként',
+      seats: {
+        label: 'Felhasználói helyek',
+        numberOfSeats: 'Felhasználói helyek száma',
+        count: {
+          '=1': '# felhasználói hely',
+          other: '# felhasználói hely',
+          _mode: 'plural',
+        },
+        range: '{min} - {max} felhasználói hely',
+        minimum: 'Legalább {min} felhasználói hely',
+        maximum: 'Legfeljebb {max} felhasználói hely',
+        updateFailed: 'A felhasználói helyek frissítése nem sikerült',
+      },
+      inclTax: 'ÁFA (tartalmazza)',
     },
     trial: {
       ends: 'A próbaidőszak ekkor jár le: {endDate}',

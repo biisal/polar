@@ -1,10 +1,10 @@
 from collections.abc import Sequence
 from uuid import UUID
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, case, func, select, update
 from sqlalchemy.orm import joinedload
 
-from polar.auth.models import AuthSubject, Organization, User, is_organization, is_user
+from polar.authz.types import AccessibleOrganizationID
 from polar.kit.repository import (
     RepositoryBase,
     RepositorySoftDeletionIDMixin,
@@ -12,7 +12,6 @@ from polar.kit.repository import (
 )
 from polar.models.customer import Customer
 from polar.models.member import Member, MemberRole
-from polar.models.user_organization import UserOrganization
 from polar.postgres import AsyncReadSession, AsyncSession
 
 
@@ -119,7 +118,11 @@ class MemberRepository(
         *,
         include_deleted: bool = False,
     ) -> Member | None:
-        """Get the owner member for a customer."""
+        """Get the owner member for a customer.
+
+        A customer must have at most one active owner; raises
+        `MultipleResultsFound` otherwise so the invariant violation is loud.
+        """
         statement = (
             select(Member)
             .where(
@@ -132,6 +135,36 @@ class MemberRepository(
             statement = statement.where(Member.is_deleted.is_(False))
         result = await session.execute(statement)
         return result.unique().scalar_one_or_none()
+
+    async def transfer_ownership(
+        self,
+        session: AsyncSession,
+        *,
+        current_owner: Member,
+        new_owner: Member,
+    ) -> None:
+        """Swap the `owner` role from one member to another in a single UPDATE,
+        and refresh both instances so their in-memory `role` matches the DB.
+
+        The partial unique index on `(customer_id) WHERE role = 'owner'` is
+        evaluated at statement end, so running demote+promote as two separate
+        statements would briefly expose two owners and trip the constraint.
+        A single CASE-based UPDATE moves both rows atomically.
+        """
+        statement = (
+            update(Member)
+            .where(Member.id.in_([current_owner.id, new_owner.id]))
+            .values(
+                role=case(
+                    (Member.id == new_owner.id, MemberRole.owner),
+                    (Member.id == current_owner.id, MemberRole.billing_manager),
+                    else_=Member.role,
+                )
+            )
+        )
+        await session.execute(statement)
+        await session.refresh(current_owner, attribute_names=["role"])
+        await session.refresh(new_owner, attribute_names=["role"])
 
     async def list_by_email_and_organization(
         self,
@@ -174,39 +207,7 @@ class MemberRepository(
         result = await session.execute(statement)
         return result.scalars().all()
 
-    async def get_existing_ids(
-        self,
-        member_ids: set[UUID],
-    ) -> set[UUID]:
-        """Return the subset of member_ids that exist and are not deleted."""
-        if not member_ids:
-            return set()
-        statement = select(Member.id).where(
-            Member.is_deleted.is_(False),
-            Member.id.in_(member_ids),
-        )
-        result = await self.session.execute(statement)
-        return set(result.scalars().all())
-
-    def get_readable_statement(
-        self, auth_subject: AuthSubject[User | Organization]
+    def get_statement_by_org_ids(
+        self, org_ids: set[AccessibleOrganizationID]
     ) -> Select[tuple[Member]]:
-        """Get a statement filtered by the auth subject's access to organizations."""
-        statement = self.get_base_statement()
-
-        if is_user(auth_subject):
-            user = auth_subject.subject
-            statement = statement.where(
-                Member.organization_id.in_(
-                    select(UserOrganization.organization_id).where(
-                        UserOrganization.user_id == user.id,
-                        UserOrganization.is_deleted.is_(False),
-                    )
-                )
-            )
-        elif is_organization(auth_subject):
-            statement = statement.where(
-                Member.organization_id == auth_subject.subject.id,
-            )
-
-        return statement
+        return self.get_base_statement().where(Member.organization_id.in_(org_ids))

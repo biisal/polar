@@ -299,7 +299,15 @@ class TaskDrain:
         fn: Any,
         message: dict[str, Any],
     ) -> Exception | None:
-        """Execute a single task function with proper CurrentMessage context."""
+        """Execute a single task function with proper CurrentMessage context.
+
+        Each task runs inside an outer SAVEPOINT so that if the task
+        fails (and ``AsyncSessionMaker`` calls ``session.rollback()``),
+        the rollback is contained and cannot corrupt the shared test
+        session.  Successful tasks release the SAVEPOINT, making their
+        changes visible in the connection's transaction for subsequent
+        tasks and assertions.
+        """
         args = message.get("args", ())
         kwargs = message.get("kwargs", {})
         options = message.get("options", {})
@@ -318,11 +326,25 @@ class TaskDrain:
         )
         CurrentMessage._MESSAGE.set(msg)
         try:
-            await fn(*args, **kwargs)
-            return None
-        except Retry:
-            return None
-        except Exception as exc:
-            return exc
+            nested = await self._session.begin_nested()
+            try:
+                await fn(*args, **kwargs)
+            except Retry:
+                # Retry is success from the drain's perspective.
+                # The inner rollback already happened; just make sure
+                # our SAVEPOINT is cleaned up.
+                if nested.is_active:
+                    await nested.rollback()
+                return None
+            except Exception as exc:
+                if nested.is_active:
+                    await nested.rollback()
+                return exc
+            else:
+                # Task succeeded — release the SAVEPOINT so its changes
+                # are visible in the outer transaction.
+                if nested.is_active:
+                    await nested.commit()
+                return None
         finally:
             CurrentMessage._MESSAGE.set(None)

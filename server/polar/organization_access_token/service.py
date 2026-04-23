@@ -6,7 +6,9 @@ from uuid import UUID
 import structlog
 from sqlalchemy import UnaryExpression, asc, desc
 
-from polar.auth.models import AuthSubject, Organization, is_user
+from polar.auth.models import AuthSubject, Organization, is_organization, is_user
+from polar.auth.scope import Scope
+from polar.authz.service import get_accessible_org_ids
 from polar.config import settings
 from polar.email.schemas import (
     OrganizationAccessTokenLeakedEmail,
@@ -14,6 +16,7 @@ from polar.email.schemas import (
 )
 from polar.email.sender import enqueue_email_template
 from polar.enums import TokenType
+from polar.exceptions import PolarRequestValidationError
 from polar.integrations.loops.service import loops as loops_service
 from polar.kit.crypto import generate_token_hash_pair, get_token_hash
 from polar.kit.pagination import PaginationParams
@@ -49,7 +52,8 @@ class OrganizationAccessTokenService:
         ],
     ) -> tuple[Sequence[OrganizationAccessToken], int]:
         repository = OrganizationAccessTokenRepository.from_session(session)
-        statement = repository.get_readable_statement(auth_subject)
+        org_ids = await get_accessible_org_ids(session, auth_subject)
+        statement = repository.get_statement_by_org_ids(org_ids)
 
         if organization_id is not None:
             statement = statement.where(
@@ -88,7 +92,8 @@ class OrganizationAccessTokenService:
         id: UUID,
     ) -> OrganizationAccessToken | None:
         repository = OrganizationAccessTokenRepository.from_session(session)
-        statement = repository.get_readable_statement(auth_subject).where(
+        org_ids = await get_accessible_org_ids(session, auth_subject)
+        statement = repository.get_statement_by_org_ids(org_ids).where(
             OrganizationAccessToken.id == id,
             OrganizationAccessToken.is_deleted.is_(False),
         )
@@ -110,6 +115,7 @@ class OrganizationAccessTokenService:
         organization = await get_payload_organization(
             session, auth_subject, create_schema
         )
+        self._validate_scopes_within_caller(auth_subject, create_schema.scopes)
         token, token_hash = generate_token_hash_pair(
             secret=settings.SECRET, prefix=TOKEN_PREFIX
         )
@@ -139,6 +145,7 @@ class OrganizationAccessTokenService:
     async def update(
         self,
         session: AsyncSession,
+        auth_subject: AuthSubject[User | Organization],
         organization_access_token: OrganizationAccessToken,
         update_schema: OrganizationAccessTokenUpdate,
     ) -> OrganizationAccessToken:
@@ -146,11 +153,34 @@ class OrganizationAccessTokenService:
 
         update_dict = update_schema.model_dump(exclude={"scopes"}, exclude_unset=True)
         if update_schema.scopes is not None:
+            self._validate_scopes_within_caller(auth_subject, update_schema.scopes)
             update_dict["scope"] = " ".join(update_schema.scopes)
 
         return await repository.update(
             organization_access_token, update_dict=update_dict
         )
+
+    def _validate_scopes_within_caller(
+        self,
+        auth_subject: AuthSubject[User | Organization],
+        requested_scopes: Sequence[str],
+    ) -> None:
+        if not is_organization(auth_subject):
+            return
+        caller_scopes = auth_subject.scopes
+        requested = {Scope(s) for s in requested_scopes}
+        excess = requested - caller_scopes
+        if excess:
+            raise PolarRequestValidationError(
+                [
+                    {
+                        "type": "value_error",
+                        "loc": ("body", "scopes"),
+                        "msg": ("Requested scopes exceed the caller's own scopes."),
+                        "input": sorted(s.value for s in excess),
+                    }
+                ]
+            )
 
     async def delete(
         self, session: AsyncSession, organization_access_token: OrganizationAccessToken

@@ -4,7 +4,6 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.orm import joinedload
 
-from polar.account.repository import AccountRepository
 from polar.customer.repository import CustomerRepository
 from polar.email.schemas import (
     OrganizationReviewedEmail,
@@ -12,7 +11,6 @@ from polar.email.schemas import (
 )
 from polar.email.sender import enqueue_email_template
 from polar.exceptions import PolarTaskError
-from polar.held_balance.service import held_balance as held_balance_service
 from polar.integrations.plain.service import plain as plain_service
 from polar.member.repository import MemberRepository
 from polar.member.service import member_service
@@ -42,15 +40,6 @@ class OrganizationDoesNotExist(OrganizationTaskError):
         super().__init__(message)
 
 
-class OrganizationAccountNotSet(OrganizationTaskError):
-    def __init__(self, organization_id: uuid.UUID) -> None:
-        self.organization_id = organization_id
-        message = (
-            f"The organization with id {organization_id} does not have an account set."
-        )
-        super().__init__(message)
-
-
 class AccountDoesNotExist(OrganizationTaskError):
     def __init__(self, account_id: uuid.UUID) -> None:
         self.account_id = account_id
@@ -74,41 +63,18 @@ async def organization_created(organization_id: uuid.UUID) -> None:
             raise OrganizationDoesNotExist(organization_id)
 
 
-@actor(actor_name="organization.account_set", priority=TaskPriority.LOW)
-async def organization_account_set(organization_id: uuid.UUID) -> None:
+@actor(actor_name="organization.under_review", priority=TaskPriority.LOW)
+async def organization_under_review(organization_id: uuid.UUID) -> None:
     async with AsyncSessionMaker() as session:
         repository = OrganizationRepository.from_session(session)
         organization = await repository.get_by_id(organization_id)
         if organization is None:
             raise OrganizationDoesNotExist(organization_id)
 
-        if organization.account_id is None:
-            raise OrganizationAccountNotSet(organization_id)
-
-        account_repository = AccountRepository.from_session(session)
-        account = await account_repository.get_by_id(organization.account_id)
-        if account is None:
-            raise AccountDoesNotExist(organization.account_id)
-
-        await held_balance_service.release_account(session, account)
-
-
-@actor(actor_name="organization.under_review", priority=TaskPriority.LOW)
-async def organization_under_review(organization_id: uuid.UUID) -> None:
-    async with AsyncSessionMaker() as session:
-        repository = OrganizationRepository.from_session(session)
-        organization = await repository.get_by_id(
-            organization_id, options=(joinedload(Organization.account),)
-        )
-        if organization is None:
-            raise OrganizationDoesNotExist(organization_id)
-
         is_auto_approve_eligible = (
-            organization.status == OrganizationStatus.ONGOING_REVIEW
+            organization.status == OrganizationStatus.REVIEW
+            and organization.initially_reviewed_at is not None
         )
-
-        if not is_auto_approve_eligible:
-            await plain_service.create_organization_review_thread(session, organization)
 
         enqueue_job(
             "organization_review.run_agent",
@@ -119,23 +85,20 @@ async def organization_under_review(organization_id: uuid.UUID) -> None:
 
 @actor(actor_name="organization.reviewed", priority=TaskPriority.LOW)
 async def organization_reviewed(
-    organization_id: uuid.UUID, initial_review: bool = False
+    organization_id: uuid.UUID,
+    initial_review: bool = False,
+    silent: bool = False,
 ) -> None:
     async with AsyncSessionMaker() as session:
         repository = OrganizationRepository.from_session(session)
-        organization = await repository.get_by_id(organization_id)
+        organization = await repository.get_by_id(
+            organization_id, options=(joinedload(Organization.account),)
+        )
         if organization is None:
             raise OrganizationDoesNotExist(organization_id)
 
-        # Release held balance if account exists
-        if organization.account_id:
-            account_repository = AccountRepository.from_session(session)
-            account = await account_repository.get_by_id(organization.account_id)
-            if account:
-                await held_balance_service.release_account(session, account)
-
         # Send an email after the initial review
-        if initial_review:
+        if initial_review and not silent:
             admin_user = await repository.get_admin_user(session, organization)
             if admin_user:
                 email = OrganizationReviewedEmail(

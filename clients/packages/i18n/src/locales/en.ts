@@ -57,6 +57,11 @@ export default {
         _llmContext:
           'Taxes applied to the order. This is VAT or sales tax. Prefer the specific term used in the target locale over a generic taxes (e.g. TVA in French, BTW in Dutch, etc.)',
       },
+      inclTax: {
+        value: 'Taxes (included)',
+        _llmContext:
+          'Label for the tax line in the pricing breakdown when tax is already included in the displayed price. Prefer the specific tax term used in the target locale (e.g. TVA (incluse) in French, BTW (inbegrepen) in Dutch, Moms (inkluderad) in Swedish, etc.)',
+      },
       free: 'Free',
       payWhatYouWant: {
         value: 'Pay what you want',
@@ -92,6 +97,32 @@ export default {
       },
       additionalMeteredUsage: 'Additional metered usage',
       perUnit: '/ unit',
+      perSeat: 'per seat',
+      seats: {
+        label: 'Seats',
+        numberOfSeats: 'Number of seats',
+        count: {
+          _mode: 'plural',
+          '=1': '# seat',
+          other: '# seats',
+        },
+        range: {
+          value: '{min} - {max} seats',
+          _llmContext:
+            'Shown when a seat-based product has both a minimum and maximum seat count. Displayed as: "5 - 100 seats". Always plural.',
+        },
+        minimum: {
+          value: 'Minimum {min} seats',
+          _llmContext:
+            'Shown when a seat-based product has a minimum seat count but no maximum. The {min} value is always > 1 in this context, so the noun is always plural.',
+        },
+        maximum: {
+          value: 'Maximum {max} seats',
+          _llmContext:
+            'Shown when a seat-based product has a maximum seat count but no minimum constraint. The {max} value can be any number, but the message is always rendered with the plural noun.',
+        },
+        updateFailed: 'Failed to update seats',
+      },
       discount: {
         duration: {
           months: {

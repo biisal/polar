@@ -8,8 +8,11 @@ from zoneinfo import ZoneInfo
 import logfire
 from sqlalchemy import ColumnElement, FromClause, select, text
 
-from polar.auth.models import AuthSubject, is_organization, is_user
+from polar.auth.models import AuthSubject
+from polar.authz.service import get_accessible_org_ids
+from polar.authz.types import AccessibleOrganizationID
 from polar.config import settings
+from polar.customer.repository import CustomerRepository
 from polar.kit.time_queries import TimeInterval, get_timestamp_series_cte
 from polar.models import (
     Customer,
@@ -17,12 +20,13 @@ from polar.models import (
     Organization,
     Product,
     User,
-    UserOrganization,
 )
 from polar.models.product import ProductBillingType
 from polar.organization.resolver import get_payload_organization
 from polar.postgres import AsyncReadSession, AsyncSession
+from polar.redis import Redis
 
+from .cache import build_cache_key, get_cached_metrics, set_cached_metrics
 from .metrics import (
     METRICS,
     METRICS_POST_COMPUTE,
@@ -90,7 +94,7 @@ def _expand_metrics_with_dependencies(
 
 
 class _TinybirdFilters(NamedTuple):
-    org_ids: list[uuid.UUID]
+    org_ids: list[AccessibleOrganizationID]
     product_id: Sequence[uuid.UUID] | None
     customer_ids: list[uuid.UUID] | None
     external_customer_id: list[str] | None
@@ -107,7 +111,8 @@ class MetricsService:
         organization_id: Sequence[uuid.UUID] | None = None,
     ) -> Sequence[MetricDashboard]:
         repository = MetricDashboardRepository.from_session(session)
-        statement = repository.get_readable_statement(auth_subject)
+        org_ids = await get_accessible_org_ids(session, auth_subject)
+        statement = repository.get_statement_by_org_ids(org_ids)
         if organization_id is not None:
             statement = statement.where(
                 MetricDashboard.organization_id.in_(organization_id)
@@ -121,7 +126,8 @@ class MetricsService:
         id: uuid.UUID,
     ) -> MetricDashboard | None:
         repository = MetricDashboardRepository.from_session(session)
-        statement = repository.get_readable_statement(auth_subject).where(
+        org_ids = await get_accessible_org_ids(session, auth_subject)
+        statement = repository.get_statement_by_org_ids(org_ids).where(
             MetricDashboard.id == id
         )
         return await repository.get_one_or_none(statement)
@@ -177,7 +183,40 @@ class MetricsService:
         customer_id: Sequence[uuid.UUID] | None = None,
         metrics: Sequence[str] | None = None,
         now: datetime | None = None,
+        redis: Redis | None = None,
     ) -> MetricsResponse:
+        pg_slugs, tb_slugs, meta_slugs = _expand_metrics_with_dependencies(metrics)
+
+        tb_filters = await self._resolve_tinybird_filters(
+            session,
+            auth_subject,
+            organization_id=organization_id,
+            product_id=product_id,
+            billing_type=billing_type,
+            customer_id=customer_id,
+            tb_needed=tb_slugs,
+        )
+
+        cache_key: str | None = None
+        if redis is not None and now is None:
+            cache_key = build_cache_key(
+                start_date=start_date,
+                end_date=end_date,
+                timezone=timezone,
+                interval=interval,
+                organization_ids=tb_filters.org_ids,
+                product_ids=tb_filters.product_id,
+                customer_ids=tb_filters.customer_ids,
+                external_customer_ids=tb_filters.external_customer_id,
+                billing_type=billing_type,
+                metrics=metrics,
+            )
+            with logfire.span("Get metrics cache", cache_key=cache_key) as span:
+                cached = await get_cached_metrics(redis, cache_key)
+                span.set_attribute("cache_hit", cached is not None)
+            if cached is not None:
+                return cached
+
         await session.execute(text(f"SET LOCAL TIME ZONE '{timezone.key}'"))
         await session.execute(text("SET LOCAL plan_cache_mode = 'force_custom_plan'"))
         start_timestamp = datetime(
@@ -202,8 +241,6 @@ class MetricsService:
 
         now_dt = now or datetime.now(tz=timezone)
 
-        pg_slugs, tb_slugs, meta_slugs = _expand_metrics_with_dependencies(metrics)
-
         filtered_pg_metrics = [m for m in METRICS_POSTGRES if m.slug in pg_slugs]
         filtered_tb_metrics = [m for m in METRICS_TINYBIRD if m.slug in tb_slugs]
         filtered_post_compute = [
@@ -216,16 +253,6 @@ class MetricsService:
         pg_query_fns: list[QueryCallable] = [
             fn for qt, fn in QUERY_TO_FUNCTION.items() if qt in required_queries
         ]
-
-        tb_filters = await self._resolve_tinybird_filters(
-            session,
-            auth_subject,
-            organization_id=organization_id,
-            product_id=product_id,
-            billing_type=billing_type,
-            customer_id=customer_id,
-            tb_needed=tb_slugs,
-        )
 
         pg_coro = self._get_metrics_from_pg(
             session,
@@ -314,13 +341,19 @@ class MetricsService:
                 for p in periods
             ]
 
-        return MetricsResponse.model_validate(
+        response = MetricsResponse.model_validate(
             {
                 "periods": periods,
                 "totals": totals,
                 "metrics": {m.slug: m for m in filtered_all_metrics},
             }
         )
+
+        if redis is not None and cache_key is not None:
+            with logfire.span("Set metrics cache", cache_key=cache_key):
+                await set_cached_metrics(redis, cache_key, response)
+
+        return response
 
     async def _get_metrics_from_pg(
         self,
@@ -408,18 +441,16 @@ class MetricsService:
         auth_subject: AuthSubject[User | Organization],
         *,
         organization_id: Sequence[uuid.UUID] | None = None,
-    ) -> list[uuid.UUID]:
+    ) -> list[AccessibleOrganizationID]:
+        """Get accessible org IDs, optionally filtered to a subset."""
+        org_ids = await get_accessible_org_ids(session, auth_subject)
         if organization_id is not None and len(organization_id) > 0:
-            return list(organization_id)
-        if is_organization(auth_subject):
-            return [auth_subject.subject.id]
-        if is_user(auth_subject):
-            stmt = select(UserOrganization.organization_id).where(
-                UserOrganization.user_id == auth_subject.subject.id,
-                UserOrganization.is_deleted.is_(False),
-            )
-            return list(await session.scalars(stmt))
-        return []
+            return [
+                AccessibleOrganizationID(oid)
+                for oid in organization_id
+                if oid in org_ids
+            ]
+        return list(org_ids)
 
     async def _resolve_tinybird_filters(
         self,
@@ -432,20 +463,22 @@ class MetricsService:
         customer_id: Sequence[uuid.UUID] | None = None,
         tb_needed: set[str],
     ) -> _TinybirdFilters:
-        external_customer_id: list[str] | None = None
-        if customer_id is not None:
-            stmt = select(Customer.external_id).where(
-                Customer.id.in_(customer_id),
-                Customer.external_id.is_not(None),
-                Customer.external_id != "",
-            )
-            external_ids = [eid for eid in await session.scalars(stmt) if eid]
-            if external_ids:
-                external_customer_id = external_ids
-
         tb_org_ids = await self._get_org_ids_for_subject(
             session, auth_subject, organization_id=organization_id
         )
+
+        external_customer_id: list[str] | None = None
+        if customer_id is not None:
+            customer_repository = CustomerRepository.from_session(session)
+            external_ids = [
+                eid
+                for eid in await customer_repository.get_readable_external_ids_by_ids(
+                    set(tb_org_ids), customer_id
+                )
+                if eid
+            ]
+            if external_ids:
+                external_customer_id = external_ids
 
         tb_product_id = product_id
         if billing_type is not None and tb_org_ids:
@@ -501,7 +534,7 @@ class MetricsService:
         original_end_timestamp: datetime,
         timezone: ZoneInfo,
         interval: TimeInterval,
-        tb_org_ids: list[uuid.UUID],
+        tb_org_ids: list[AccessibleOrganizationID],
         product_id: Sequence[uuid.UUID] | None = None,
         billing_type: Sequence[ProductBillingType] | None = None,
         tb_customer_ids: list[uuid.UUID] | None = None,

@@ -2,6 +2,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from pytest_mock import MockerFixture
 
 from polar.models import Account, Organization, User, UserOrganization
 from polar.user_organization.service import (
@@ -12,25 +13,35 @@ from polar.user_organization.service import (
 from polar.user_organization.service import (
     user_organization as user_organization_service,
 )
+from tests.fixtures.database import SaveFixture
 
 
 @pytest.mark.asyncio
 class TestRemoveMemberSafe:
     async def test_remove_member_success(
         self,
+        save_fixture: SaveFixture,
         session: Any,
         organization: Organization,
         user: User,
+        user_second: User,
         user_organization: UserOrganization,
     ) -> None:
+        user_organization = UserOrganization(
+            user=user_second, organization=organization
+        )
+        await save_fixture(user_organization)
+
         # Test successful member removal
         await user_organization_service.remove_member_safe(
-            session, user.id, organization.id
+            session,
+            user_id=user_second.id,
+            organization_id=organization.id,
         )
 
         # Verify the member was soft deleted
         user_org = await user_organization_service.get_by_user_and_org(
-            session, user.id, organization.id
+            session, user_second.id, organization.id
         )
         assert user_org is None
 
@@ -44,7 +55,9 @@ class TestRemoveMemberSafe:
 
         with pytest.raises(OrganizationNotFound) as exc_info:
             await user_organization_service.remove_member_safe(
-                session, user.id, non_existent_org_id
+                session,
+                user_id=user.id,
+                organization_id=non_existent_org_id,
             )
 
         assert exc_info.value.organization_id == non_existent_org_id
@@ -58,7 +71,9 @@ class TestRemoveMemberSafe:
         # Test with user who is not a member
         with pytest.raises(UserNotMemberOfOrganization) as exc_info:
             await user_organization_service.remove_member_safe(
-                session, user.id, organization.id
+                session,
+                user_id=user.id,
+                organization_id=organization.id,
             )
 
         assert exc_info.value.user_id == user.id
@@ -87,7 +102,9 @@ class TestRemoveMemberSafe:
         # Test trying to remove organization admin
         with pytest.raises(CannotRemoveOrganizationAdmin) as exc_info:
             await user_organization_service.remove_member_safe(
-                session, user.id, organization.id
+                session,
+                user_id=user.id,
+                organization_id=organization.id,
             )
 
         assert exc_info.value.user_id == user.id
@@ -114,7 +131,9 @@ class TestRemoveMemberSafe:
 
         # Test removing a non-admin member from organization with account
         await user_organization_service.remove_member_safe(
-            session, user_second.id, organization.id
+            session,
+            user_id=user_second.id,
+            organization_id=organization.id,
         )
 
         # Verify the member was soft deleted
@@ -122,24 +141,6 @@ class TestRemoveMemberSafe:
             UserOrganization | None
         ) = await user_organization_service.get_by_user_and_org(
             session, user_second.id, organization.id
-        )
-        assert user_org is None
-
-    async def test_remove_member_no_account(
-        self,
-        session: Any,
-        organization: Organization,
-        user: User,
-        user_organization: UserOrganization,
-    ) -> None:
-        # Test removing member from organization without account (no admin check)
-        await user_organization_service.remove_member_safe(
-            session, user.id, organization.id
-        )
-
-        # Verify the member was soft deleted
-        user_org = await user_organization_service.get_by_user_and_org(
-            session, user.id, organization.id
         )
         assert user_org is None
 
@@ -154,7 +155,11 @@ class TestRemoveMember:
         user_organization: UserOrganization,
     ) -> None:
         # Test that remove_member performs soft delete
-        await user_organization_service.remove_member(session, user.id, organization.id)
+        await user_organization_service.remove_member(
+            session,
+            user_id=user.id,
+            organization_id=organization.id,
+        )
 
         # Verify the member was soft deleted (not returned by get_by_user_and_org)
         user_org = await user_organization_service.get_by_user_and_org(
@@ -175,6 +180,48 @@ class TestRemoveMember:
         assert deleted_user_org is not None
         assert deleted_user_org.deleted_at is not None
 
+    async def test_enqueues_polar_self_member_removal(
+        self,
+        mocker: MockerFixture,
+        session: Any,
+        organization: Organization,
+        user: User,
+        user_organization: UserOrganization,
+    ) -> None:
+        enqueue_remove_member_mock = mocker.patch(
+            "polar.user_organization.service.polar_self_service.enqueue_remove_member"
+        )
+
+        await user_organization_service.remove_member(
+            session,
+            user_id=user.id,
+            organization_id=organization.id,
+        )
+
+        enqueue_remove_member_mock.assert_called_once_with(
+            external_customer_id=str(organization.id),
+            external_id=str(user.id),
+        )
+
+    async def test_does_not_enqueue_when_member_not_found(
+        self,
+        mocker: MockerFixture,
+        session: Any,
+        organization: Organization,
+        user: User,
+    ) -> None:
+        enqueue_remove_member_mock = mocker.patch(
+            "polar.user_organization.service.polar_self_service.enqueue_remove_member"
+        )
+
+        await user_organization_service.remove_member(
+            session,
+            user_id=user.id,
+            organization_id=organization.id,
+        )
+
+        enqueue_remove_member_mock.assert_not_called()
+
 
 @pytest.mark.asyncio
 class TestListByOrg:
@@ -191,7 +238,11 @@ class TestListByOrg:
         assert members[0].user_id == user.id
 
         # After soft delete, should not return the member
-        await user_organization_service.remove_member(session, user.id, organization.id)
+        await user_organization_service.remove_member(
+            session,
+            user_id=user.id,
+            organization_id=organization.id,
+        )
 
         members = await user_organization_service.list_by_org(session, organization.id)
         assert len(members) == 0

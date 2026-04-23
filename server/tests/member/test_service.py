@@ -7,13 +7,103 @@ from sqlalchemy.exc import IntegrityError
 
 from polar.auth.models import AuthSubject
 from polar.kit.pagination import PaginationParams
+from polar.member.repository import MemberRepository
 from polar.member.service import member_service
 from polar.models import Customer, Member, Organization, User, UserOrganization
 from polar.models.member import MemberRole
 from polar.postgres import AsyncSession
 from tests.fixtures.auth import AuthSubjectFixture
 from tests.fixtures.database import SaveFixture
-from tests.fixtures.random_objects import create_customer
+from tests.fixtures.random_objects import (
+    create_account,
+    create_customer,
+    create_member,
+    create_organization,
+)
+
+
+@pytest.mark.asyncio
+class TestGetByExternalID:
+    @pytest.mark.auth(
+        AuthSubjectFixture(subject="user"), AuthSubjectFixture(subject="organization")
+    )
+    async def test_valid(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        auth_subject: AuthSubject[User | Organization],
+        organization: Organization,
+        user_organization: UserOrganization,
+    ) -> None:
+        customer = await create_customer(
+            save_fixture,
+            organization=organization,
+            email="customer@example.com",
+        )
+
+        member = Member(
+            customer_id=customer.id,
+            organization_id=organization.id,
+            email="member@example.com",
+            name="Test Member",
+            external_id="ext_svc_123",
+            role=MemberRole.member,
+        )
+        await save_fixture(member)
+
+        result = await member_service.get_by_external_id(
+            session, auth_subject, "ext_svc_123"
+        )
+
+        assert result is not None
+        assert result.id == member.id
+        assert result.external_id == "ext_svc_123"
+
+    @pytest.mark.auth(
+        AuthSubjectFixture(subject="user"), AuthSubjectFixture(subject="organization")
+    )
+    async def test_not_existing(
+        self,
+        session: AsyncSession,
+        auth_subject: AuthSubject[User | Organization],
+        user_organization: UserOrganization,
+    ) -> None:
+        result = await member_service.get_by_external_id(
+            session, auth_subject, "nonexistent"
+        )
+
+        assert result is None
+
+    @pytest.mark.auth
+    async def test_not_accessible_organization(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        auth_subject: AuthSubject[User],
+        user: User,
+    ) -> None:
+        other_account = await create_account(save_fixture, user)
+        other_org = await create_organization(save_fixture, other_account)
+        customer = await create_customer(
+            save_fixture,
+            organization=other_org,
+            email="customer@example.com",
+        )
+
+        member = Member(
+            customer_id=customer.id,
+            organization_id=other_org.id,
+            email="member@example.com",
+            external_id="ext_other_org",
+            role=MemberRole.member,
+        )
+        await save_fixture(member)
+
+        result = await member_service.get_by_external_id(
+            session, auth_subject, "ext_other_org"
+        )
+
+        assert result is None
 
 
 @pytest.mark.asyncio
@@ -24,11 +114,11 @@ class TestList:
         session: AsyncSession,
         auth_subject: AuthSubject[User],
         save_fixture: SaveFixture,
+        user: User,
     ) -> None:
         """Test that user cannot access members from organizations they don't belong to."""
-        from tests.fixtures.random_objects import create_organization
-
-        other_org = await create_organization(save_fixture)
+        other_account = await create_account(save_fixture, user)
+        other_org = await create_organization(save_fixture, other_account)
         customer = await create_customer(
             save_fixture,
             organization=other_org,
@@ -296,6 +386,40 @@ class TestCreateOwnerMember:
         assert member is not None
         assert member.external_id is None
         assert member.email == customer.email
+
+    async def test_reuses_existing_owner_when_customer_email_drifted(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        """When owner.email has drifted from customer.email, auto-create must
+        reuse the existing owner rather than insert a second row."""
+        organization.feature_settings = {"member_model_enabled": True}
+        await save_fixture(organization)
+
+        customer = await create_customer(
+            save_fixture,
+            organization=organization,
+            email="correct@example.com",
+        )
+        existing = Member(
+            customer_id=customer.id,
+            organization_id=organization.id,
+            email="drifted@example.com",
+            role=MemberRole.owner,
+        )
+        await save_fixture(existing)
+
+        member = await member_service.create_owner_member(
+            session, customer, organization
+        )
+
+        assert member is not None
+        assert member.id == existing.id
+        repository = MemberRepository.from_session(session)
+        members = await repository.list_by_customer(session, customer.id)
+        assert len([m for m in members if m.role == MemberRole.owner]) == 1
 
 
 @pytest.mark.asyncio
@@ -567,6 +691,80 @@ class TestUpdate:
             await member_service.update(session, member, role=MemberRole.owner)
 
         assert "only the owner can transfer ownership" in str(exc_info.value).lower()
+
+    @pytest.mark.auth
+    async def test_update_ownership_transfer_customer_portal(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        """Regression: the partial unique index on (customer_id) WHERE role='owner'
+        would trip if demote+promote ran as two separate UPDATEs."""
+        customer = await create_customer(
+            save_fixture, organization=organization, email="customer@example.com"
+        )
+        owner = await create_member(
+            save_fixture,
+            customer=customer,
+            organization=organization,
+            role=MemberRole.owner,
+            email="owner@example.com",
+        )
+        member = await create_member(
+            save_fixture,
+            customer=customer,
+            organization=organization,
+            role=MemberRole.member,
+            email="member@example.com",
+        )
+
+        updated = await member_service.update(
+            session, member, role=MemberRole.owner, caller_member=owner
+        )
+
+        assert updated.role == MemberRole.owner
+
+        await session.refresh(owner)
+        await session.refresh(member)
+        assert owner.role == MemberRole.billing_manager
+        assert member.role == MemberRole.owner
+
+    @pytest.mark.auth
+    async def test_update_ownership_transfer_admin(
+        self,
+        save_fixture: SaveFixture,
+        session: AsyncSession,
+        organization: Organization,
+    ) -> None:
+        customer = await create_customer(
+            save_fixture, organization=organization, email="customer@example.com"
+        )
+        owner = await create_member(
+            save_fixture,
+            customer=customer,
+            organization=organization,
+            role=MemberRole.owner,
+            email="owner@example.com",
+        )
+        member = await create_member(
+            save_fixture,
+            customer=customer,
+            organization=organization,
+            role=MemberRole.member,
+            email="member@example.com",
+        )
+
+        updated = await member_service.update(
+            session, member, role=MemberRole.owner, allow_ownership_transfer=True
+        )
+
+        assert updated.role == MemberRole.owner
+
+        await session.refresh(owner)
+        await session.refresh(member)
+        assert owner.role == MemberRole.billing_manager
+        assert member.role == MemberRole.owner
 
     @pytest.mark.auth
     async def test_update_no_changes(
@@ -886,8 +1084,6 @@ class TestGetOrCreateByEmail:
         await save_fixture(existing)
 
         # Mock repository.create to raise IntegrityError, simulating a race
-        from polar.member.repository import MemberRepository
-
         original_create = MemberRepository.create
 
         call_count = 0

@@ -42,6 +42,7 @@ from polar.models.subscription import SubscriptionStatus
 from polar.postgres import AsyncSession
 from tests.fixtures.database import SaveFixture, get_database_url, save_fixture_factory
 from tests.fixtures.random_objects import (
+    create_account,
     create_checkout,
     create_customer,
     create_discount,
@@ -552,6 +553,7 @@ QUERY_CASES: tuple[QueryCase, ...] = (
         start_date=date(2024, 1, 1),
         end_date=date(2024, 3, 1),
         interval=TimeInterval.month,
+        now=datetime(2024, 2, 15, tzinfo=UTC),
         auth_type="user",
     ),
     QueryCase(
@@ -1092,6 +1094,15 @@ async def _seed_trial_excluded_from_mrr(
             "started_at": date(2024, 1, 1),
             "trial_start": date(2024, 1, 1),
             "trial_end": date(2024, 3, 1),
+            "product": "monthly_subscription",
+        },
+        # Trialing sub with scheduled cancellation before trial end — should count
+        # in trial MRR but NOT in trial committed MRR.
+        "trialing_canceling_subscription": {
+            "started_at": date(2024, 1, 1),
+            "trial_start": date(2024, 1, 1),
+            "trial_end": date(2024, 3, 1),
+            "ends_at": date(2024, 2, 20),
             "product": "monthly_subscription",
         },
     }
@@ -2254,7 +2265,8 @@ async def metrics_harness(
             unauthorized_user = await create_user(save_fixture)
 
             async def make_org(key: str) -> Organization:
-                org = await create_organization(save_fixture)
+                account = await create_account(save_fixture, user)
+                org = await create_organization(save_fixture, account)
                 uo = UserOrganization(user=user, organization=org)
                 await save_fixture(uo)
                 return org
@@ -2525,7 +2537,8 @@ async def checkout_metrics_harness(
 
         async def make_context(key: str) -> CheckoutMetricsContext:
             user = await create_user(save_fixture)
-            organization = await create_organization(save_fixture)
+            account = await create_account(save_fixture, user)
+            organization = await create_organization(save_fixture, account)
             await save_fixture(UserOrganization(user=user, organization=organization))
             context = CheckoutMetricsContext(organization=organization, user=user)
             scenarios[key] = context
@@ -3432,16 +3445,26 @@ class TestGetMetrics:
 
         assert len(metrics.periods) == 3
 
-        # Jan & Feb: only the active sub counts; trialing sub excluded
+        # Jan: active sub in MRR; both trialing subs in trial MRR; only the one
+        # without a scheduled cancellation counts as trial-committed.
         jan = metrics.periods[0]
         assert jan.monthly_recurring_revenue == 100_00
+        assert jan.trial_monthly_recurring_revenue == 200_00
+        assert jan.trial_committed_monthly_recurring_revenue == 100_00
 
+        # Feb: trialing_canceling's ends_at is inside this bucket, so it drops
+        # out of the active window — only the plain trialing sub remains.
         feb = metrics.periods[1]
         assert feb.monthly_recurring_revenue == 100_00
+        assert feb.trial_monthly_recurring_revenue == 100_00
+        assert feb.trial_committed_monthly_recurring_revenue == 100_00
 
-        # Mar: trial ends in this bucket so both subs count
+        # Mar: trial ends in this bucket so trialing falls into MRR; trialing_canceling
+        # already dropped out.
         mar = metrics.periods[2]
         assert mar.monthly_recurring_revenue == 200_00
+        assert mar.trial_monthly_recurring_revenue == 0
+        assert mar.trial_committed_monthly_recurring_revenue == 0
 
     async def test_mrr_subscription_forever_discount(
         self,

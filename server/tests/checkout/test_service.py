@@ -942,6 +942,7 @@ class TestCreate:
             == "https://example.com/success?checkout_id={CHECKOUT_SESSION_ID}"
         )
 
+    @pytest.mark.auth
     async def test_silent_calculate_tax_error(
         self,
         session: AsyncSession,
@@ -975,6 +976,7 @@ class TestCreate:
             (TaxBehavior.inclusive, 1000, 100, 900),
         ],
     )
+    @pytest.mark.auth
     async def test_valid_calculate_tax(
         self,
         tax_behavior: TaxBehavior,
@@ -986,6 +988,7 @@ class TestCreate:
         auth_subject: AuthSubject[User | Organization],
         calculate_tax_mock: AsyncMock,
         organization: Organization,
+        user_organization: UserOrganization,
     ) -> None:
         product = await create_product(
             save_fixture,
@@ -1086,6 +1089,7 @@ class TestCreate:
         "custom_field_data",
         [pytest.param({"text": "abc", "select": "c"}, id="invalid select")],
     )
+    @pytest.mark.auth
     async def test_invalid_custom_field_data(
         self,
         custom_field_data: dict[str, Any],
@@ -1110,6 +1114,7 @@ class TestCreate:
         for error in e.value.errors():
             assert error["loc"][0:2] == ("body", "custom_field_data")
 
+    @pytest.mark.auth
     async def test_valid_custom_field_data(
         self,
         session: AsyncSession,
@@ -1131,6 +1136,7 @@ class TestCreate:
 
         assert checkout.custom_field_data == {"text": "abc", "select": "a"}
 
+    @pytest.mark.auth
     async def test_valid_missing_required_custom_field(
         self,
         session: AsyncSession,
@@ -1178,6 +1184,7 @@ class TestCreate:
 
         assert checkout.embed_origin == "https://example.com"
 
+    @pytest.mark.auth
     async def test_valid_tax_not_applicable(
         self,
         session: AsyncSession,
@@ -1202,6 +1209,7 @@ class TestCreate:
         assert checkout.customer_billing_address is not None
         assert checkout.customer_billing_address.country == "FR"
 
+    @pytest.mark.auth
     async def test_valid_discount(
         self,
         session: AsyncSession,
@@ -3239,6 +3247,32 @@ class TestUpdate:
             )
         )
 
+    @pytest.mark.parametrize(
+        "pad",
+        [
+            pytest.param(" ", id="single_space"),
+            pytest.param("  ", id="double_space"),
+            pytest.param(" \t", id="mixed_space_tab"),
+            pytest.param("\t", id="tab"),
+        ],
+    )
+    async def test_valid_discount_code_with_whitespace(
+        self,
+        pad: str,
+        session: AsyncSession,
+        checkout_one_time_fixed: Checkout,
+        discount_fixed_once: Discount,
+    ) -> None:
+        checkout = await checkout_service.update(
+            session,
+            checkout_one_time_fixed,
+            CheckoutUpdatePublic(
+                discount_code=f"{pad}{discount_fixed_once.code}{pad}",
+            ),
+        )
+
+        assert checkout.discount == discount_fixed_once
+
     async def test_full_discount_resets_is_business_customer(
         self,
         save_fixture: SaveFixture,
@@ -4889,10 +4923,7 @@ class TestConfirm:
         organization: Organization,
         checkout_one_time_fixed: Checkout,
     ) -> None:
-        # Make organization not payment ready (new org without account setup)
-        organization.created_at = datetime(2025, 8, 4, 12, 0, tzinfo=UTC)
-        organization.status = OrganizationStatus.CREATED
-        organization.account_id = None
+        organization.set_status(OrganizationStatus.BLOCKED)
         await save_fixture(organization)
 
         # Payment confirmation should fail for paid products
@@ -4918,10 +4949,9 @@ class TestConfirm:
         mocker: MockerFixture,
         stripe_service_mock: MagicMock,
     ) -> None:
-        # Make organization not payment ready (new org without account setup)
+        # Make organization not payment ready
         organization.created_at = datetime(2025, 8, 4, 12, 0, tzinfo=UTC)
         organization.status = OrganizationStatus.CREATED
-        organization.account_id = None
         await save_fixture(organization)
 
         # Mock environment to be sandbox
@@ -4974,10 +5004,9 @@ class TestConfirm:
         checkout_one_time_free: Checkout,
         mocker: MockerFixture,
     ) -> None:
-        # Make organization not payment ready (new org without account setup)
+        # Make organization not payment ready
         organization.created_at = datetime(2025, 8, 4, 12, 0, tzinfo=UTC)
         organization.status = OrganizationStatus.CREATED
-        organization.account_id = None
         await save_fixture(organization)
 
         # Mock Stripe service for customer creation
@@ -5012,10 +5041,7 @@ class TestConfirm:
         organization: Organization,
         checkout_recurring_fixed: Checkout,
     ) -> None:
-        # Make organization not payment ready
-        organization.created_at = datetime(2025, 8, 4, 12, 0, tzinfo=UTC)
-        organization.status = OrganizationStatus.CREATED
-        organization.account_id = None
+        organization.set_status(OrganizationStatus.BLOCKED)
         await save_fixture(organization)
 
         # Should fail for recurring products
@@ -5052,7 +5078,6 @@ class TestConfirm:
         # Make organization grandfathered (created before cutoff)
         organization.created_at = datetime(2025, 8, 4, 8, 0, tzinfo=UTC)
         organization.status = OrganizationStatus.CREATED
-        organization.account_id = None
         await save_fixture(organization)
 
         # Setup Stripe mocks
@@ -5093,7 +5118,7 @@ class TestConfirm:
         assert confirmed_checkout.status == CheckoutStatus.confirmed
         stripe_service_mock.create_payment_intent.assert_called_once()
 
-    async def test_payment_not_ready_with_account_setup_complete(
+    async def test_payment_ready_with_account_setup_complete(
         self,
         save_fixture: SaveFixture,
         session: AsyncSession,
@@ -5129,7 +5154,7 @@ class TestConfirm:
         stripe_customer.id = "cus_test"
         stripe_service_mock.create_customer.return_value = stripe_customer
 
-        # Should be allowed since account setup is complete (is_details_submitted=True)
+        # Should be allowed since setup is complete (active and payout account exists)
         confirmed_checkout = await checkout_service.confirm(
             session,
             auth_subject,
@@ -5161,10 +5186,7 @@ class TestConfirm:
         organization: Organization,
         checkout_discount_percentage_100: Checkout,
     ) -> None:
-        # Make organization not payment ready
-        organization.created_at = datetime(2025, 8, 4, 12, 0, tzinfo=UTC)
-        organization.status = OrganizationStatus.CREATED
-        organization.account_id = None
+        organization.set_status(OrganizationStatus.BLOCKED)
         await save_fixture(organization)
 
         # Verify preconditions: discount makes it free but payment setup needed
@@ -5225,7 +5247,6 @@ class TestConfirm:
         # Make organization not payment ready
         organization.created_at = datetime(2025, 8, 4, 12, 0, tzinfo=UTC)
         organization.status = OrganizationStatus.CREATED
-        organization.account_id = None
         await save_fixture(organization)
 
         # Verify preconditions
@@ -5294,7 +5315,6 @@ class TestConfirm:
         # Make organization not payment ready
         organization.created_at = datetime(2025, 8, 4, 12, 0, tzinfo=UTC)
         organization.status = OrganizationStatus.CREATED
-        organization.account_id = None
         await save_fixture(organization)
 
         # Verify preconditions: free one-time product doesn't need payment setup

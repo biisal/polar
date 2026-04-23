@@ -11,6 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import contains_eager, joinedload, selectinload
 
 from polar.auth.models import AuthSubject
+from polar.authz.service import get_accessible_org_ids
 from polar.billing_entry.repository import BillingEntryRepository
 from polar.billing_entry.service import MeteredLineItem
 from polar.billing_entry.service import billing_entry as billing_entry_service
@@ -347,6 +348,8 @@ class SubscriptionService:
         session: AsyncSession,
         subscription_create: SubscriptionCreate,
         auth_subject: AuthSubject[User | Organization],
+        *,
+        created_at: datetime | None = None,
     ) -> Subscription:
         errors: list[ValidationError] = []
 
@@ -399,19 +402,20 @@ class SubscriptionService:
 
         customer: Customer | None = None
         customer_repository = CustomerRepository.from_session(session)
+        org_ids = await get_accessible_org_ids(session, auth_subject)
         error_loc: str
         input_value: uuid.UUID | str
         if isinstance(subscription_create, SubscriptionCreateCustomer):
             error_loc = "customer_id"
             input_value = subscription_create.customer_id
             customer = await customer_repository.get_readable_by_id(
-                auth_subject, input_value
+                org_ids, input_value
             )
         else:
             error_loc = "external_customer_id"
             input_value = subscription_create.external_customer_id
             customer = await customer_repository.get_readable_by_external_id(
-                auth_subject, input_value
+                org_ids, input_value
             )
 
         if customer is None:
@@ -474,6 +478,8 @@ class SubscriptionService:
             user_metadata=subscription_create.metadata,
             pending_update=None,
         )
+        if created_at is not None:
+            subscription.created_at = created_at
 
         repository = SubscriptionRepository.from_session(session)
         subscription = await repository.create(subscription, flush=True)
@@ -657,6 +663,16 @@ class SubscriptionService:
     ) -> Subscription:
         if not subscription.active:
             raise InactiveSubscription(subscription)
+
+        # Defensive: capability may have flipped off between scheduler
+        # pick-up and task execution.
+        if not subscription.organization.can_renew_subscriptions:
+            log.info(
+                "Subscription renewals disabled for organization, skipping cycle",
+                subscription_id=subscription.id,
+                organization_id=subscription.organization.id,
+            )
+            return subscription
 
         revoke = subscription.cancel_at_period_end
         previous_status = subscription.status
@@ -850,6 +866,7 @@ class SubscriptionService:
                     recurring_interval_count=subscription.recurring_interval_count,
                     started_at=subscription.started_at.isoformat(),
                 ),
+                timestamp=subscription.created_at,
             ),
         )
 
@@ -2018,6 +2035,7 @@ class SubscriptionService:
                     type=NotificationType.maintainer_new_paid_subscription,
                     payload=MaintainerNewPaidSubscriptionNotificationPayload(
                         subscriber_name=subscription.customer.display_name,
+                        subscriber_email=subscription.customer.email,
                         tier_name=product.name,
                         tier_price_amount=subscription.amount,
                         tier_price_recurring_interval=subscription.recurring_interval,
